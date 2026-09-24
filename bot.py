@@ -10,8 +10,8 @@ from dotenv import load_dotenv
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID_STR = os.getenv("OWNER_ID", "6803988521").strip()
+BOT_TOKEN = "8598111134:AAFM3QnXCANWTJ3pVXxIVWGCtKavIqoBtRk"
+OWNER_ID_STR = "6803988521"
 try:
     OWNER_ID = int(OWNER_ID_STR)
 except ValueError:
