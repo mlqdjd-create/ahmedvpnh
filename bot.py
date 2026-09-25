@@ -2,7 +2,8 @@ import os
 import sys
 import asyncio
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from html import escape as html_escape
 from urllib.parse import unquote
 
 from telegram import (
@@ -18,6 +19,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
+from telegram.error import BadRequest, TelegramError
 
 import config
 import database
@@ -27,33 +29,52 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-# تقليل ضجيج httpx
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Application").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Updater").setLevel(logging.WARNING)
 logger = logging.getLogger("AhmedVpnBot")
 
-# حالة المحادثات
+# ==================== CONSTANTS ====================
+PARSE_MODE = "HTML"
 SESSIONS: Dict[int, Dict[str, Any]] = {}
 
 
 # ==================== HELPERS ====================
 
+def esc(text) -> str:
+    """Escape آمن لأي نص قبل HTML"""
+    if text is None:
+        return ""
+    return html_escape(str(text), quote=False)
+
+
+def code(text) -> str:
+    """يغلّف النص بـ <code> مع escape"""
+    return f"<code>{esc(text)}</code>"
+
+
+def b(text) -> str:
+    """نص عريض"""
+    return f"<b>{esc(text)}</b>"
+
+
 def get_flag_for_name(name: str) -> str:
-    n = name.upper()
-    if "GERMAN" in n or "DE" in n or "ألمان" in n:
+    n = (name or "").upper()
+    if "GERMAN" in n or "ألمان" in n:
         return "🇩🇪"
-    elif "NETHER" in n or "NL" in n or "هولند" in n:
+    elif "NETHER" in n or "هولند" in n:
         return "🇳🇱"
-    elif "FRANCE" in n or "FR" in n or "فرنس" in n:
+    elif "FRANCE" in n or "فرنس" in n:
         return "🇫🇷"
-    elif "USA" in n or "US" in n or "AMERICA" in n or "أمريك" in n:
+    elif "USA" in n or "AMERICA" in n or "أمريك" in n:
         return "🇺🇸"
-    elif "TURK" in n or "TR" in n or "ترك" in n:
+    elif "TURK" in n or "ترك" in n:
         return "🇹🇷"
-    elif "UK" in n or "GB" in n or "BRIT" in n or "بريطان" in n:
+    elif "UK" in n or "BRIT" in n or "بريطان" in n:
         return "🇬🇧"
-    elif "SINGAPORE" in n or "SG" in n:
+    elif "SINGAPORE" in n:
         return "🇸🇬"
-    elif "CANADA" in n or "CA" in n:
+    elif "CANADA" in n:
         return "🇨🇦"
     return "🌐"
 
@@ -69,7 +90,7 @@ def get_main_menu_keyboard(is_super_owner: bool = False):
             InlineKeyboardButton("🔄 تحديث السيرفرات", callback_data="menu_refresh")
         ],
         [
-            InlineKeyboardButton("👥 عدد مستخدمي التطبيق والإحصائيات", callback_data="menu_stats")
+            InlineKeyboardButton("👥 إحصائيات المستخدمين", callback_data="menu_stats")
         ],
         [
             InlineKeyboardButton("➕ إضافة أدمن", callback_data="menu_add_admin"),
@@ -79,21 +100,77 @@ def get_main_menu_keyboard(is_super_owner: bool = False):
     return InlineKeyboardMarkup(keyboard)
 
 
+async def safe_edit(query, text: str, keyboard=None):
+    """يعدّل الرسالة — يتجاهل 'Message is not modified' بهدوء"""
+    try:
+        await query.edit_message_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=PARSE_MODE,
+            disable_web_page_preview=True,
+        )
+    except BadRequest as e:
+        err = str(e).lower()
+        if "message is not modified" in err:
+            return  # لا شيء — طبيعي
+        if "can't parse entities" in err:
+            logger.warning(f"Parse error — fallback to plain text")
+            try:
+                await query.edit_message_text(
+                    text,
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+            return
+        raise
+    except TelegramError as e:
+        logger.warning(f"TelegramError in safe_edit: {e}")
+
+
+async def safe_reply(message, text: str, keyboard=None):
+    """يرسل رد — يتعامل مع أخطاء التنسيق"""
+    try:
+        await message.reply_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=PARSE_MODE,
+            disable_web_page_preview=True,
+        )
+    except BadRequest as e:
+        err = str(e).lower()
+        if "can't parse entities" in err:
+            try:
+                await message.reply_text(
+                    text,
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+            return
+        raise
+
+
 # ==================== ACCESS CONTROL ====================
 
 async def check_admin_access(update: Update) -> bool:
     user = update.effective_user
     if not user or not database.is_admin(user.id):
         msg = (
-            "⛔ **عذراً، هذا البوت خاص بإدارة تطبيق AHMED VPN فقط.**\n\n"
-            f"آيدي المستخدم الخاص بك: `{user.id if user else 'غير معروف'}` غير مصرح له بالدخول."
+            "⛔ <b>عذراً، هذا البوت خاص بإدارة تطبيق AHMED VPN فقط.</b>\n\n"
+            f"آيدي المستخدم: {code(user.id if user else 'غير معروف')} غير مصرح له بالدخول."
         )
         try:
             if update.callback_query:
-                await update.callback_query.answer("⛔ غير مصرح لك باستخدام هذا البوت.", show_alert=True)
-                await update.callback_query.edit_message_text(msg, parse_mode="Markdown")
+                await update.callback_query.answer(
+                    "⛔ غير مصرح لك باستخدام هذا البوت.",
+                    show_alert=True
+                )
+                await safe_edit(update.callback_query, msg)
             elif update.message:
-                await update.message.reply_text(msg, parse_mode="Markdown")
+                await update.message.reply_text(msg, parse_mode=PARSE_MODE)
         except Exception as e:
             logger.error(f"check_admin_access error: {e}")
         return False
@@ -103,28 +180,45 @@ async def check_admin_access(update: Update) -> bool:
 # ==================== ERROR HANDLER ====================
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """معالج أخطاء عام — يمنع البوت من الكف"""
+    """معالج أخطاء شامل — يمنع البوت من الكف"""
     error = context.error
-
-    # تجاهل أخطاء الشبكة المؤقتة (البوت يكمل تلقائياً)
-    if isinstance(error, asyncio.TimeoutError):
-        logger.warning("Timeout — سيعيد المحاولة تلقائياً")
+    if error is None:
         return
 
     err_str = str(error)
+    err_low = err_str.lower()
 
-    # Conflict — يتجاهل بهدوء لأن Telegram يعالج تلقائياً
-    if "Conflict" in err_str or "terminated by other" in err_str:
-        logger.warning(f"⚠️ Conflict — نسخة أخرى تعمل، سيُعاد المحاولة")
+    # 1) أخطاء سطحية — نتجاهلها بهدوء
+    IGNORE = [
+        "message is not modified",
+        "query is too old",
+        "message to delete not found",
+        "message can't be deleted",
+    ]
+    for ig in IGNORE:
+        if ig in err_low:
+            return
+
+    # 2) أخطاء تنسيق — نسجّلها فقط
+    if "can't parse entities" in err_low:
+        logger.warning(f"⚠️ Parse error (تنسيق): {err_str[:150]}")
         return
 
-    # Bad Gateway / Network errors
-    if any(x in err_str for x in ["Bad Gateway", "Network", "timed out"]):
-        logger.warning(f"⚠️ خطأ شبكة مؤقت: {error}")
+    # 3) أخطاء شبكة مؤقتة
+    if any(x in err_low for x in [
+        "timeout", "bad gateway", "network", "connection",
+        "temporary failure", "getaddrinfo"
+    ]):
+        logger.warning(f"⚠️ شبكة مؤقتة: {err_str[:120]}")
         return
 
-    # سجّل باقي الأخطاء
-    logger.error(f"❌ خطأ غير متوقع: {error}", exc_info=error)
+    # 4) Conflict — نسخة أخرى
+    if "conflict" in err_low or "terminated by other" in err_low:
+        logger.warning("⚠️ Conflict — نسخة أخرى تعمل")
+        return
+
+    # 5) خطأ فعلي
+    logger.error(f"❌ خطأ: {type(error).__name__}: {err_str[:200]}")
 
 
 # ==================== COMMANDS ====================
@@ -140,101 +234,90 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats = database.get_system_stats()
         is_super = (user.id == config.OWNER_ID)
 
+        rank = "المالك الأساسي 👑" if is_super else "مشرف معتمد 👮‍♂️"
+
         text = (
-            f"🚀 **{config.APP_NAME} — لوحة تحكم الإدارة** 🛡️\n\n"
-            f"أهلاً بك يا {user.first_name} في لوحة التحكم الكاملة.\n"
-            f"رتبتك: **{'المالك الأساسي 👑' if is_super else 'مشرف معتمد 👮‍♂️'}**\n\n"
-            f"👥 مستخدمي التطبيق: `{stats['total_users']}`\n"
-            f"🖥️ عدد السيرفرات النشطة: `{stats['total_servers']}`\n"
-            f"👮‍♂️ المشرفين: `{stats['total_admins']}`\n\n"
-            "اختر أحد الإجراءات من الأزرار أدناه:"
+            f"🚀 <b>{esc(config.APP_NAME)} — لوحة تحكم الإدارة</b> 🛡️\n\n"
+            f"أهلاً بك يا <b>{esc(user.first_name)}</b>\n"
+            f"رتبتك: <b>{rank}</b>\n\n"
+            f"👥 مستخدمي التطبيق: {code(stats['total_users'])}\n"
+            f"🖥️ السيرفرات النشطة: {code(stats['total_servers'])}\n"
+            f"👮‍♂️ المشرفين: {code(stats['total_admins'])}\n\n"
+            "اختر إجراءً من الأزرار:"
         )
         await update.message.reply_text(
             text,
             reply_markup=get_main_menu_keyboard(is_super),
-            parse_mode="Markdown"
+            parse_mode=PARSE_MODE,
         )
     except Exception as e:
-        logger.error(f"start_command error: {e}")
-        try:
-            await update.message.reply_text("⚠️ حدث خطأ، حاول مرة أخرى.")
-        except Exception:
-            pass
+        logger.error(f"start_command error: {e}", exc_info=True)
 
 
 # ==================== CALLBACKS ====================
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
     try:
-        query = update.callback_query
         await query.answer()
-        user = update.effective_user
+    except Exception:
+        pass
 
+    try:
+        user = update.effective_user
         if not await check_admin_access(update):
             return
 
         data = query.data
         is_super = (user.id == config.OWNER_ID)
 
-        # ---------- Refresh / Main ----------
+        # ---------- Main / Refresh ----------
         if data in ("menu_refresh", "menu_main"):
             SESSIONS.pop(user.id, None)
             stats = database.get_system_stats()
             text = (
-                f"🚀 **{config.APP_NAME} — لوحة تحكم الإدارة** 🛡️\n\n"
-                f"👥 مستخدمي التطبيق: `{stats['total_users']}`\n"
-                f"🖥️ عدد السيرفرات النشطة: `{stats['total_servers']}`\n"
-                f"👮‍♂️ المشرفين: `{stats['total_admins']}`\n"
-                f"🕒 آخر تحديث: `{stats['last_updated']}`\n"
-                f"🌐 حالة الـ API: `{stats['api_status']}`\n\n"
-                "اختر أحد الإجراءات للبدء:"
+                f"🚀 <b>{esc(config.APP_NAME)} — لوحة التحكم</b> 🛡️\n\n"
+                f"👥 المستخدمين: {code(stats['total_users'])}\n"
+                f"🖥️ السيرفرات: {code(stats['total_servers'])}\n"
+                f"👮‍♂️ المشرفين: {code(stats['total_admins'])}\n"
+                f"🕒 آخر تحديث: {code(stats['last_updated'])}\n"
+                f"🌐 API: {code(stats['api_status'])}\n\n"
+                "اختر إجراءً:"
             )
-            await query.edit_message_text(
-                text,
-                reply_markup=get_main_menu_keyboard(is_super),
-                parse_mode="Markdown"
-            )
+            await safe_edit(query, text, get_main_menu_keyboard(is_super))
 
         # ---------- Stats ----------
         elif data == "menu_stats":
             stats = database.get_system_stats()
             text = (
-                "📊 **إحصائيات تطبيق AHMED VPN الشاملة:**\n"
+                "📊 <b>إحصائيات تطبيق AHMED VPN:</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👥 **عدد مستخدمي التطبيق الفعلي:** `{stats['total_users']}` مستخدم\n"
-                f"🖥️ **عدد السيرفرات المتاحة:** `{stats['total_servers']}` سيرفر\n"
-                f"👮‍♂️ **عدد مدراء النظام (Admins):** `{stats['total_admins']}` أدمن\n"
-                f"🕒 **آخر وقت تحديث:** `{stats['last_updated']}`\n"
-                f"🟢 **حالة الـ API:** `{stats['api_status']}`\n"
+                f"👥 المستخدمين: {code(stats['total_users'])}\n"
+                f"🖥️ السيرفرات: {code(stats['total_servers'])}\n"
+                f"👮‍♂️ المشرفين: {code(stats['total_admins'])}\n"
+                f"🕒 آخر تحديث: {code(stats['last_updated'])}\n"
+                f"🟢 الحالة: {code(stats['api_status'])}\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "💡 يتم تسجيل وتحديث مستخدمي التطبيق الفعليين تلقائياً عند فتح التطبيق."
+                "💡 يُحدّث تلقائياً عند فتح التطبيق."
             )
             keyboard = [
-                [InlineKeyboardButton("🔄 تحديث الإحصائيات", callback_data="menu_stats")],
-                [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")]
+                [InlineKeyboardButton("🔄 تحديث", callback_data="menu_stats")],
+                [InlineKeyboardButton("🔙 القائمة", callback_data="menu_main")]
             ]
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
         # ---------- Add Server ----------
         elif data == "menu_add_server":
             SESSIONS[user.id] = {"action": "add_server", "step": "name", "data": {}}
             text = (
-                "➕ **إضافة سيرفر جديد (الخطوة 1 من 3):**\n\n"
-                "أرسل الآن **اسم السيرفر**:\n"
-                "*(مثال: Germany 01)*\n\n"
-                "💡 أو يمكنك إرسال رابط السيرفر مباشرة "
-                "(`vless://...`, `vmess://...`, `trojan://...`) ليتم حفظه فورياً."
+                "➕ <b>إضافة سيرفر جديد (1/3)</b>\n\n"
+                "أرسل الآن <b>اسم السيرفر</b>:\n"
+                "<i>(مثال: Germany 01)</i>\n\n"
+                "💡 أو أرسل رابط مباشر (<code>vless://...</code>, "
+                "<code>vmess://...</code>, <code>trojan://...</code>)"
             )
             keyboard = [[InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")]]
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
         elif data.startswith("set_proto_"):
             proto = data.split("_")[-1]
@@ -243,67 +326,56 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 session["data"]["protocol"] = proto
                 session["step"] = "config"
                 text = (
-                    f"✅ تم اختيار البروتوكول: `{proto}`\n\n"
-                    "🔗 **الخطوة 3 من 3:**\n"
-                    f"أرسل الآن **رابط السيرفر** (يبدأ بـ `{proto.lower()}://`):"
+                    f"✅ البروتوكول: {code(proto)}\n\n"
+                    f"🔗 <b>الخطوة 3 من 3</b>\n"
+                    f"أرسل الآن <b>رابط السيرفر</b> (يبدأ بـ {code(proto.lower() + '://')}):"
                 )
                 keyboard = [[InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")]]
-                await query.edit_message_text(
-                    text,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode="Markdown"
-                )
+                await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+            else:
+                await safe_edit(query, "⚠️ انتهت الجلسة. أعد من البداية.", get_main_menu_keyboard(is_super))
 
         # ---------- List Servers ----------
         elif data == "menu_list_servers":
             servers = database.get_all_servers()
             if not servers:
-                text = "📋 **لا توجد سيرفرات مضافة حالياً في قاعدة البيانات.**"
+                text = "📋 <b>لا توجد سيرفرات مضافة حالياً.</b>"
                 keyboard = [
                     [InlineKeyboardButton("➕ إضافة سيرفر", callback_data="menu_add_server")],
                     [InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")]
                 ]
-                await query.edit_message_text(
-                    text,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode="Markdown"
-                )
+                await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
                 return
 
-            text = f"📋 **عرض السيرفرات المتاحة ({len(servers)} سيرفر):**\n\n"
-            for s in servers:
+            # نعرض 10 سيرفرات فقط لتجنب تجاوز حد الرسالة
+            text = f"📋 <b>السيرفرات المتاحة ({len(servers)} سيرفر):</b>\n\n"
+            for s in servers[:10]:
                 flag = get_flag_for_name(s["name"])
                 text += (
                     f"━━━━━━━━━━━━━━━━━━━\n"
-                    f"🔹 **ID:** `{s['id']}`\n"
-                    f"🏷️ **الاسم:** {flag} {s['name']}\n"
-                    f"⚡ **البروتوكول:** `{s['protocol']}`\n"
-                    f"📅 **تاريخ الإضافة:** `{s['created_at']}`\n"
+                    f"🔹 ID: {code(s['id'])}\n"
+                    f"🏷️ {flag} <b>{esc(s['name'])}</b>\n"
+                    f"⚡ {code(s['protocol'])}\n"
                 )
-            text += "━━━━━━━━━━━━━━━━━━━"
+            if len(servers) > 10:
+                text += f"\n<i>... و {len(servers) - 10} سيرفر إضافي</i>"
+            text += "\n━━━━━━━━━━━━━━━━━━━"
+
             keyboard = [
                 [InlineKeyboardButton("➕ إضافة سيرفر", callback_data="menu_add_server")],
                 [InlineKeyboardButton("🗑️ مسح سيرفر", callback_data="menu_delete_server_0")],
-                [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")]
+                [InlineKeyboardButton("🔙 القائمة", callback_data="menu_main")]
             ]
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
         # ---------- Delete Server ----------
         elif data.startswith("menu_delete_server_"):
             page = int(data.split("_")[-1])
             servers = database.get_all_servers()
             if not servers:
-                text = "🗑️ **لا توجد سيرفرات لحذفها حالياً.**"
-                keyboard = [[InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")]]
-                await query.edit_message_text(
-                    text,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode="Markdown"
-                )
+                text = "🗑️ <b>لا توجد سيرفرات لحذفها.</b>"
+                keyboard = [[InlineKeyboardButton("🔙 القائمة", callback_data="menu_main")]]
+                await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
                 return
 
             per_page = 5
@@ -314,59 +386,49 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = []
             for s in current_page:
                 flag = get_flag_for_name(s["name"])
+                label = f"🗑️ {flag} {s['name'][:25]} ({s['protocol']})"
                 keyboard.append([
                     InlineKeyboardButton(
-                        f"🗑️ {flag} {s['name']} ({s['protocol']})",
+                        label,
                         callback_data=f"confirm_del_srv_{s['id']}"
                     )
                 ])
 
             nav = []
             if page > 0:
-                nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"menu_delete_server_{page - 1}"))
+                nav.append(InlineKeyboardButton("⬅️", callback_data=f"menu_delete_server_{page - 1}"))
             if end_idx < len(servers):
-                nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"menu_delete_server_{page + 1}"))
+                nav.append(InlineKeyboardButton("➡️", callback_data=f"menu_delete_server_{page + 1}"))
             if nav:
                 keyboard.append(nav)
 
-            keyboard.append([InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")])
+            keyboard.append([InlineKeyboardButton("🔙 القائمة", callback_data="menu_main")])
 
-            text = "🗑️ **اختر السيرفر الذي ترغب بحذفه نهائياً من قاعدة البيانات:**"
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            text = f"🗑️ <b>اختر سيرفر للحذف</b>\n(صفحة {page + 1})"
+            await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
         elif data.startswith("confirm_del_srv_"):
             server_id = int(data.split("_")[-1])
             server = database.get_server_by_id(server_id)
             if not server:
                 await query.answer("السيرفر غير موجود!", show_alert=True)
-                await query.edit_message_text(
-                    "السيرفر غير موجود.",
-                    reply_markup=get_main_menu_keyboard(is_super)
-                )
+                await safe_edit(query, "السيرفر غير موجود.", get_main_menu_keyboard(is_super))
                 return
 
             flag = get_flag_for_name(server["name"])
             text = (
-                f"⚠️ **تأكيد حذف السيرفر نهائياً:**\n\n"
-                f"هل أنت متأكد من حذف السيرفر:\n"
-                f"**{flag} {server['name']}** (`{server['protocol']}`)\n\n"
-                "⚠️ سيتم حذفه فعلياً من قاعدة البيانات."
+                f"⚠️ <b>تأكيد الحذف</b>\n\n"
+                f"هل تريد حذف السيرفر:\n"
+                f"{flag} <b>{esc(server['name'])}</b> ({code(server['protocol'])})؟\n\n"
+                f"<i>سيُحذف نهائياً من قاعدة البيانات.</i>"
             )
             keyboard = [
                 [
-                    InlineKeyboardButton("✅ نعم، حذف نهائي", callback_data=f"execute_del_srv_{server_id}"),
+                    InlineKeyboardButton("✅ حذف", callback_data=f"execute_del_srv_{server_id}"),
                     InlineKeyboardButton("❌ إلغاء", callback_data="menu_delete_server_0")
                 ]
             ]
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
         elif data.startswith("execute_del_srv_"):
             server_id = int(data.split("_")[-1])
@@ -375,84 +437,78 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             deleted = database.delete_server(server_id)
 
             if deleted:
-                await query.answer("تم حذف السيرفر بنجاح!", show_alert=True)
-                text = f"✅ **تم حذف السيرفر بنجاح:**\n`{name}`"
+                try:
+                    await query.answer("✅ تم الحذف!", show_alert=False)
+                except Exception:
+                    pass
+                text = f"✅ <b>تم حذف السيرفر:</b> {esc(name)}"
             else:
-                await query.answer("تعذر الحذف!", show_alert=True)
-                text = f"⚠️ تعذر حذف السيرفر `{name}`"
+                try:
+                    await query.answer("⚠️ تعذر الحذف", show_alert=True)
+                except Exception:
+                    pass
+                text = f"⚠️ تعذر حذف: {esc(name)}"
 
             keyboard = [
-                [InlineKeyboardButton("🗑️ مسح سيرفر آخر", callback_data="menu_delete_server_0")],
-                [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")]
+                [InlineKeyboardButton("🗑️ حذف آخر", callback_data="menu_delete_server_0")],
+                [InlineKeyboardButton("🔙 القائمة", callback_data="menu_main")]
             ]
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
         # ---------- Admins ----------
         elif data == "menu_add_admin":
             SESSIONS[user.id] = {"action": "add_admin", "step": "id"}
             text = (
-                "➕ **إضافة أدمن جديد:**\n\n"
-                "أرسل الآن **معرّف التليجرام (Telegram ID)** الخاص بالشخص:\n"
-                "*(مثال: `123456789`)*"
+                "➕ <b>إضافة أدمن جديد</b>\n\n"
+                "أرسل <b>معرّف Telegram</b> للشخص:\n"
+                "<i>(مثال: 123456789)</i>"
             )
             keyboard = [[InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")]]
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
         elif data == "menu_list_admins":
             admins = database.get_all_admins()
             text = (
-                "👮‍♂️ **قائمة المشرفين المعتمدين:**\n"
+                "👮‍♂️ <b>المشرفين المعتمدين</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👑 **المالك الأساسي:** `{config.OWNER_ID}`\n"
+                f"👑 المالك: {code(config.OWNER_ID)}\n"
             )
             keyboard = []
             for adm in admins:
                 aid = adm["telegram_id"]
                 if aid == config.OWNER_ID:
                     continue
-                text += f"🔹 أدمن: `{aid}` | {adm.get('username') or 'بدون اسم'}\n"
+                uname = adm.get("username") or "بدون اسم"
+                text += f"🔹 {code(aid)} — {esc(uname)}\n"
                 keyboard.append([
-                    InlineKeyboardButton(f"➖ حذف أدمن ({aid})", callback_data=f"confirm_del_adm_{aid}")
+                    InlineKeyboardButton(
+                        f"➖ حذف ({aid})",
+                        callback_data=f"confirm_del_adm_{aid}"
+                    )
                 ])
 
-            text += "━━━━━━━━━━━━━━━━━━━━━━\nاختر أدمن لحذفه:"
-            keyboard.append([InlineKeyboardButton("➕ إضافة أدمن جديد", callback_data="menu_add_admin")])
-            keyboard.append([InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")])
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            text += "━━━━━━━━━━━━━━━━━━━━━━\nاختر أدمن للحذف:"
+            keyboard.append([InlineKeyboardButton("➕ إضافة أدمن", callback_data="menu_add_admin")])
+            keyboard.append([InlineKeyboardButton("🔙 القائمة", callback_data="menu_main")])
+            await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
         elif data.startswith("confirm_del_adm_"):
             target_id = int(data.split("_")[-1])
             if target_id == config.OWNER_ID:
-                await query.answer("⛔ لا يمكن حذف المالك الأساسي!", show_alert=True)
+                await query.answer("⛔ لا يمكن حذف المالك!", show_alert=True)
                 return
 
             text = (
-                f"⚠️ **تأكيد حذف المشرف:**\n\n"
-                f"هل أنت متأكد من سحب صلاحيات الأدمن من:\n`{target_id}`؟"
+                f"⚠️ <b>تأكيد الحذف</b>\n\n"
+                f"هل تريد سحب صلاحيات الأدمن من:\n{code(target_id)}؟"
             )
             keyboard = [
                 [
-                    InlineKeyboardButton("✅ نعم، حذف الأدمن", callback_data=f"execute_del_adm_{target_id}"),
+                    InlineKeyboardButton("✅ حذف", callback_data=f"execute_del_adm_{target_id}"),
                     InlineKeyboardButton("❌ إلغاء", callback_data="menu_list_admins")
                 ]
             ]
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
         elif data.startswith("execute_del_adm_"):
             target_id = int(data.split("_")[-1])
@@ -462,26 +518,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             success = database.remove_admin(target_id)
             if success:
-                await query.answer("تم حذف الأدمن بنجاح!", show_alert=True)
-                text = f"✅ **تم حذف الأدمن `{target_id}` بنجاح.**"
+                try:
+                    await query.answer("✅ تم الحذف", show_alert=False)
+                except Exception:
+                    pass
+                text = f"✅ تم حذف الأدمن {code(target_id)}"
             else:
-                await query.answer("الأدمن غير موجود.", show_alert=True)
-                text = f"⚠️ تعذر حذف الأدمن `{target_id}`."
+                try:
+                    await query.answer("⚠️ غير موجود", show_alert=True)
+                except Exception:
+                    pass
+                text = f"⚠️ تعذر حذف {code(target_id)}"
 
             keyboard = [
-                [InlineKeyboardButton("📋 عرض المشرفين", callback_data="menu_list_admins")],
-                [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")]
+                [InlineKeyboardButton("📋 المشرفين", callback_data="menu_list_admins")],
+                [InlineKeyboardButton("🔙 القائمة", callback_data="menu_main")]
             ]
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
     except Exception as e:
         logger.error(f"callback_handler error: {e}", exc_info=True)
         try:
-            await update.callback_query.answer("⚠️ حدث خطأ.", show_alert=True)
+            await query.answer("⚠️ حدث خطأ.", show_alert=True)
         except Exception:
             pass
 
@@ -513,9 +571,12 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
                 name = f"Server {database.get_servers_count() + 1}"
                 if "#" in line:
-                    remark = unquote(line.split("#")[-1]).strip()
-                    if remark:
-                        name = remark
+                    try:
+                        remark = unquote(line.split("#")[-1]).strip()
+                        if remark:
+                            name = remark[:60]
+                    except Exception:
+                        pass
 
                 database.add_server(name=name, protocol=proto, config=line)
                 added += 1
@@ -523,20 +584,17 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
             SESSIONS.pop(user.id, None)
             flag = get_flag_for_name(last_name)
+
             reply = (
-                f"✅ **تمت إضافة {added} سيرفر بنجاح!** 🚀\n\n"
-                f"• **آخر سيرفر:** {flag} {last_name}\n"
-                f"• **البروتوكول:** `{proto}`\n"
+                f"✅ <b>تمت إضافة {added} سيرفر</b> 🚀\n\n"
+                f"• آخر سيرفر: {flag} <b>{esc(last_name)}</b>\n"
+                f"• البروتوكول: {code(proto)}"
             )
             keyboard = [
-                [InlineKeyboardButton("📋 عرض السيرفرات", callback_data="menu_list_servers")],
-                [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")]
+                [InlineKeyboardButton("📋 عرض", callback_data="menu_list_servers")],
+                [InlineKeyboardButton("🔙 القائمة", callback_data="menu_main")]
             ]
-            await update.message.reply_text(
-                reply,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            await safe_reply(update.message, reply, InlineKeyboardMarkup(keyboard))
             return
 
         # 2) إضافة أدمن
@@ -546,27 +604,22 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 if target_id <= 0:
                     raise ValueError()
             except ValueError:
-                await update.message.reply_text(
-                    "❌ **آيدي غير صالح!**\nأرسل أرقاماً فقط."
-                )
+                await safe_reply(update.message, "❌ <b>آيدي غير صالح!</b>\nأرسل أرقاماً فقط.")
                 return
 
             added = database.add_admin(telegram_id=target_id, username="", added_by=user.id)
             SESSIONS.pop(user.id, None)
-            reply = (
-                "🎉 **تمت إضافة الأدمن بنجاح!** 👮‍♂️\n\n"
-                f"• **Telegram ID:** `{target_id}`"
-            ) if added else "⚠️ حدث خطأ أثناء الإضافة."
+
+            if added:
+                reply = f"✅ <b>تمت إضافة الأدمن</b>\n• ID: {code(target_id)}"
+            else:
+                reply = "⚠️ فشل إضافة الأدمن."
 
             keyboard = [
-                [InlineKeyboardButton("👮‍♂️ قائمة المشرفين", callback_data="menu_list_admins")],
-                [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")]
+                [InlineKeyboardButton("👮‍♂️ المشرفين", callback_data="menu_list_admins")],
+                [InlineKeyboardButton("🔙 القائمة", callback_data="menu_main")]
             ]
-            await update.message.reply_text(
-                reply,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            await safe_reply(update.message, reply, InlineKeyboardMarkup(keyboard))
             return
 
         # 3) إضافة سيرفر — wizard
@@ -574,11 +627,11 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             step = session.get("step")
 
             if step == "name":
-                session["data"]["name"] = text
+                session["data"]["name"] = text[:60]
                 session["step"] = "protocol"
                 prompt = (
-                    f"🏷️ اسم السيرفر: **{text}**\n\n"
-                    "⚡ **الخطوة 2 من 3:**\nاختر **البروتوكول**:"
+                    f"🏷️ الاسم: <b>{esc(text[:60])}</b>\n\n"
+                    f"⚡ <b>الخطوة 2 من 3</b>\nاختر البروتوكول:"
                 )
                 keyboard = [
                     [
@@ -588,11 +641,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     ],
                     [InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")]
                 ]
-                await update.message.reply_text(
-                    prompt,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode="Markdown"
-                )
+                await safe_reply(update.message, prompt, InlineKeyboardMarkup(keyboard))
                 return
 
             elif step == "config":
@@ -600,38 +649,39 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 name = session["data"].get("name", "Server")
                 config_link = text
 
-                sid = database.add_server(name=name, protocol=proto, config=config_link)
-                SESSIONS.pop(user.id, None)
+                try:
+                    sid = database.add_server(name=name, protocol=proto, config=config_link)
+                    SESSIONS.pop(user.id, None)
 
-                flag = get_flag_for_name(name)
-                reply = (
-                    "🎉 **تم حفظ السيرفر بنجاح!**\n\n"
-                    f"• **ID:** `{sid}`\n"
-                    f"• **الاسم:** {flag} {name}\n"
-                    f"• **البروتوكول:** `{proto}`\n"
-                )
-                keyboard = [
-                    [InlineKeyboardButton("➕ إضافة سيرفر آخر", callback_data="menu_add_server")],
-                    [InlineKeyboardButton("📋 عرض السيرفرات", callback_data="menu_list_servers")],
-                    [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")]
-                ]
-                await update.message.reply_text(
-                    reply,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode="Markdown"
-                )
+                    flag = get_flag_for_name(name)
+                    reply = (
+                        f"✅ <b>تم حفظ السيرفر</b>\n\n"
+                        f"• ID: {code(sid)}\n"
+                        f"• الاسم: {flag} <b>{esc(name)}</b>\n"
+                        f"• البروتوكول: {code(proto)}"
+                    )
+                    keyboard = [
+                        [InlineKeyboardButton("➕ إضافة آخر", callback_data="menu_add_server")],
+                        [InlineKeyboardButton("📋 عرض", callback_data="menu_list_servers")],
+                        [InlineKeyboardButton("🔙 القائمة", callback_data="menu_main")]
+                    ]
+                    await safe_reply(update.message, reply, InlineKeyboardMarkup(keyboard))
+                except Exception as e:
+                    logger.error(f"add_server error: {e}")
+                    SESSIONS.pop(user.id, None)
+                    await safe_reply(update.message, "⚠️ فشل حفظ السيرفر.")
                 return
 
         # fallback
-        await update.message.reply_text(
-            "💡 أرسل /start لفتح لوحة التحكم، "
-            "أو أرسل رابط سيرفر (`vless://...`) لإضافته فورياً."
+        await safe_reply(
+            update.message,
+            "💡 أرسل /start لفتح اللوحة، أو أرسل رابط <code>vless://...</code> مباشرة."
         )
 
     except Exception as e:
         logger.error(f"text_message_handler error: {e}", exc_info=True)
         try:
-            await update.message.reply_text("⚠️ حدث خطأ أثناء معالجة رسالتك.")
+            await update.message.reply_text("⚠️ حدث خطأ.")
         except Exception:
             pass
 
@@ -639,47 +689,37 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 # ==================== MAIN ====================
 
 async def post_init(app: Application) -> None:
-    """يُنفّذ بعد بناء التطبيق وقبل polling"""
+    """يحذف webhook قبل polling"""
     try:
-        # ✅ احذف أي webhook موجود
         await app.bot.delete_webhook(drop_pending_updates=True)
         logger.info("✅ Webhook deleted — polling mode activated")
     except Exception as e:
-        logger.error(f"⚠️ فشل حذف webhook: {e}")
+        logger.warning(f"⚠️ فشل حذف webhook: {e}")
 
 
 def main():
     print("=" * 60)
-    print(f"  🚀 {config.APP_NAME} - Telegram Administration Bot")
+    print(f"  🚀 {config.APP_NAME} - Telegram Admin Bot")
     print(f"  Owner ID: {config.OWNER_ID}")
-    print(f"  API Endpoint: http://{config.HOST}:{config.PORT}/api/servers")
     print("=" * 60)
 
     if not config.BOT_TOKEN or config.BOT_TOKEN == "ضع_توكن_البوت_هنا":
-        print("\n" + "!" * 60)
-        print(" [!] تحذير: لم تضع BOT_TOKEN بعد!")
-        print("!" * 60 + "\n")
+        print(" [!] BOT_TOKEN غير مضبوط!")
         return
 
-    # بناء التطبيق
     app = (
         Application.builder()
         .token(config.BOT_TOKEN)
-        .post_init(post_init)          # ← يحذف webhook قبل polling
+        .post_init(post_init)
         .build()
     )
 
-    # تسجيل المعالجات
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
-
-    # ✅ معالج أخطاء عام — يمنع البوت من الكف
     app.add_error_handler(error_handler)
 
     logger.info("🤖 Bot is starting polling...")
-
-    # ✅ polling مع drop_pending_updates + معالجة أخطاء
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
