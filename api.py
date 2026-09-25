@@ -1,23 +1,15 @@
-import os
 from typing import Optional
-from pathlib import Path
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Load environment variables
-env_path = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=env_path)
-
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "ahmed_vpn_admin_secret_key_2026")
-
+import config
 import database
 
 app = FastAPI(
-    title="AHMED VPN Server API",
-    description="REST API for AHMED VPN Android client and server management",
-    version="1.0.0"
+    title=f"{config.APP_NAME} Server API",
+    description="REST API for AHMED VPN Android client, administration and server management",
+    version=config.VERSION
 )
 
 # CORS middleware for mobile & external connections
@@ -34,6 +26,10 @@ class ServerCreate(BaseModel):
     protocol: str
     config: str
 
+class UserPing(BaseModel):
+    user_id: str
+    app_version: Optional[str] = "1.0"
+
 def verify_admin_key(
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     authorization: Optional[str] = Header(None)
@@ -45,7 +41,7 @@ def verify_admin_key(
         else:
             key = authorization.strip()
 
-    if not key or key != ADMIN_API_KEY:
+    if not key or key != config.ADMIN_API_KEY:
         raise HTTPException(
             status_code=401,
             detail="Unauthorized: Valid ADMIN_API_KEY is required for this operation."
@@ -55,18 +51,41 @@ def verify_admin_key(
 @app.get("/")
 def root():
     return {
-        "app": "AHMED VPN",
+        "app": config.APP_NAME,
+        "version": config.VERSION,
         "status": "online",
         "docs": "/docs"
     }
 
 @app.get("/api/health")
 def health():
-    count = database.get_servers_count()
+    stats = database.get_system_stats()
     return {
         "status": "healthy",
-        "app": "AHMED VPN",
-        "servers_count": count
+        "app": config.APP_NAME,
+        "stats": stats
+    }
+
+@app.get("/api/stats")
+def stats():
+    return database.get_system_stats()
+
+@app.post("/api/user/ping")
+def ping_user(data: UserPing, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+        
+    success = database.register_or_update_user(
+        user_id=data.user_id,
+        client_ip=client_ip,
+        app_version=data.app_version or "1.0"
+    )
+    return {
+        "status": "success" if success else "error",
+        "registered": success,
+        "total_users": database.get_users_count()
     }
 
 @app.get("/api/servers")
@@ -128,6 +147,4 @@ def delete_server_endpoint(server_id: int):
 
 if __name__ == "__main__":
     import uvicorn
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", 8080))
-    uvicorn.run("api:app", host=host, port=port, reload=True)
+    uvicorn.run("api:app", host=config.HOST, port=config.PORT, reload=True)
