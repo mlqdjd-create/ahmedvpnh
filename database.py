@@ -1,4 +1,5 @@
 import os
+import time
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from urllib.parse import urlparse
@@ -9,41 +10,90 @@ from config import OWNER_ID
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if DATABASE_URL:
-    # ✅ استخدام PostgreSQL (Supabase) عبر pg8000
     import pg8000.dbapi as pg8000
     DB_TYPE = "postgres"
     print("[DB] ✅ Using PostgreSQL (Supabase) via pg8000")
 else:
-    # ⚠️ Fallback محلي (SQLite)
     import sqlite3
     from config import DB_FILE
     DB_TYPE = "sqlite"
-    print("[DB] ⚠️ Using local SQLite (data will be lost on redeploy)")
+    print("[DB] ⚠️ Using local SQLite")
 
-# Placeholder حسب نوع قاعدة البيانات
 PH = "%s" if DB_TYPE == "postgres" else "?"
+
+# ==================== CONNECTION POOL ====================
+
+_persistent_conn = None
+_last_check = 0
+
+
+def _create_conn():
+    """ينشئ اتصال جديد بـ PostgreSQL"""
+    url = urlparse(DATABASE_URL)
+    return pg8000.connect(
+        user=url.username,
+        password=url.password,
+        host=url.hostname,
+        port=url.port or 5432,
+        database=url.path.lstrip("/"),
+        timeout=10,
+    )
 
 
 def get_connection():
+    """يعيد اتصال دائم مع إعادة الاتصال التلقائي"""
+    global _persistent_conn, _last_check
+
     if DB_TYPE == "postgres":
-        # pg8000 مع URL parsing
-        url = urlparse(DATABASE_URL)
-        conn = pg8000.connect(
-            user=url.username,
-            password=url.password,
-            host=url.hostname,
-            port=url.port or 5432,
-            database=url.path.lstrip("/"),
-        )
-        return conn
+        now = time.time()
+        # فحص الاتصال كل 30 ثانية فقط
+        if _persistent_conn is not None and (now - _last_check) < 30:
+            return _persistent_conn
+
+        # فحص أن الاتصال حي
+        if _persistent_conn is not None:
+            try:
+                cur = _persistent_conn.cursor()
+                cur.execute("SELECT 1")
+                cur.close()
+                _last_check = now
+                return _persistent_conn
+            except Exception as e:
+                print(f"[DB] ⚠️ Connection lost, reconnecting: {e}")
+                try:
+                    _persistent_conn.close()
+                except Exception:
+                    pass
+                _persistent_conn = None
+
+        # إنشاء اتصال جديد
+        _persistent_conn = _create_conn()
+        _last_check = now
+        return _persistent_conn
     else:
         conn = sqlite3.connect(str(DB_FILE), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
 
 
+def _release(conn):
+    """لا يغلق اتصال PostgreSQL — فقط SQLite"""
+    if DB_TYPE == "sqlite":
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _commit(conn):
+    """يحفظ التغييرات"""
+    try:
+        conn.commit()
+    except Exception as e:
+        print(f"[DB] commit error: {e}")
+
+
 def _fetch_all(cursor):
-    """يحوّل النتائج إلى قائمة dicts بغض النظر عن نوع DB"""
     if DB_TYPE == "postgres":
         cols = [desc[0] for desc in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
@@ -52,7 +102,6 @@ def _fetch_all(cursor):
 
 
 def _fetch_one(cursor):
-    """يحوّل النتيجة إلى dict واحد"""
     if DB_TYPE == "postgres":
         row = cursor.fetchone()
         if row is None:
@@ -63,6 +112,8 @@ def _fetch_one(cursor):
         row = cursor.fetchone()
         return dict(row) if row else None
 
+
+# ==================== INIT ====================
 
 def init_db():
     conn = get_connection()
@@ -95,6 +146,9 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
+        # فهارس لتسريع الاستعلامات
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_servers_created ON servers(created_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen DESC)")
     else:
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS servers (
@@ -123,14 +177,15 @@ def init_db():
         )
         """)
 
-    conn.commit()
-    conn.close()
+    _commit(conn)
+    _release(conn)
     print(f"[DB] ✅ Tables initialized ({DB_TYPE})")
 
 
-# ==================== SERVERS CRUD ====================
+# ==================== SERVERS — INSERT ONLY (لا حذف) ====================
 
 def add_server(name: str, protocol: str, config: str) -> int:
+    """يضيف سيرفر جديد — لا يحذف أي شيء"""
     conn = get_connection()
     cursor = conn.cursor()
     if DB_TYPE == "postgres":
@@ -138,15 +193,16 @@ def add_server(name: str, protocol: str, config: str) -> int:
             f"INSERT INTO servers (name, protocol, config) VALUES ({PH}, {PH}, {PH}) RETURNING id",
             (name.strip(), protocol.strip().upper(), config.strip())
         )
-        new_id = cursor.fetchone()[0]
+        row = cursor.fetchone()
+        new_id = row[0]
     else:
         cursor.execute(
             f"INSERT INTO servers (name, protocol, config) VALUES ({PH}, {PH}, {PH})",
             (name.strip(), protocol.strip().upper(), config.strip())
         )
         new_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    _commit(conn)
+    _release(conn)
     return new_id
 
 
@@ -155,7 +211,7 @@ def get_all_servers() -> List[Dict[str, Any]]:
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, protocol, config, created_at FROM servers ORDER BY id DESC")
     result = _fetch_all(cursor)
-    conn.close()
+    _release(conn)
     return result
 
 
@@ -167,17 +223,18 @@ def get_server_by_id(server_id: int) -> Optional[Dict[str, Any]]:
         (server_id,)
     )
     result = _fetch_one(cursor)
-    conn.close()
+    _release(conn)
     return result
 
 
 def delete_server(server_id: int) -> bool:
+    """يحذف سيرفر واحد بالمعرف فقط — لا يحذف الكل"""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(f"DELETE FROM servers WHERE id = {PH}", (server_id,))
-    conn.commit()
+    _commit(conn)
     deleted = cursor.rowcount > 0
-    conn.close()
+    _release(conn)
     return deleted
 
 
@@ -186,12 +243,12 @@ def get_servers_count() -> int:
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM servers")
     row = cursor.fetchone()
-    count = row[0] if DB_TYPE == "postgres" else row["count"]
-    conn.close()
+    count = row[0]
+    _release(conn)
     return count
 
 
-# ==================== ADMINS MANAGEMENT ====================
+# ==================== ADMINS ====================
 
 def add_admin(telegram_id: int, username: Optional[str] = None, added_by: Optional[int] = None) -> bool:
     try:
@@ -211,8 +268,8 @@ def add_admin(telegram_id: int, username: Optional[str] = None, added_by: Option
             INSERT OR REPLACE INTO admins (telegram_id, username, added_by, added_at)
             VALUES ({PH}, {PH}, {PH}, CURRENT_TIMESTAMP)
             """, (telegram_id, username or "", added_by))
-        conn.commit()
-        conn.close()
+        _commit(conn)
+        _release(conn)
         return True
     except Exception as e:
         print(f"[DB] add_admin error: {e}")
@@ -225,9 +282,9 @@ def remove_admin(telegram_id: int) -> bool:
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(f"DELETE FROM admins WHERE telegram_id = {PH}", (telegram_id,))
-    conn.commit()
+    _commit(conn)
     deleted = cursor.rowcount > 0
-    conn.close()
+    _release(conn)
     return deleted
 
 
@@ -238,7 +295,7 @@ def is_admin(telegram_id: int) -> bool:
     cursor = conn.cursor()
     cursor.execute(f"SELECT 1 FROM admins WHERE telegram_id = {PH}", (telegram_id,))
     result = cursor.fetchone()
-    conn.close()
+    _release(conn)
     return result is not None
 
 
@@ -247,7 +304,7 @@ def get_all_admins() -> List[Dict[str, Any]]:
     cursor = conn.cursor()
     cursor.execute("SELECT telegram_id, username, added_by, added_at FROM admins ORDER BY added_at DESC")
     result = _fetch_all(cursor)
-    conn.close()
+    _release(conn)
     return result
 
 
@@ -256,14 +313,14 @@ def get_admins_count() -> int:
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM admins")
     row = cursor.fetchone()
-    db_count = row[0] if DB_TYPE == "postgres" else row["count"]
+    db_count = row[0]
     cursor.execute(f"SELECT 1 FROM admins WHERE telegram_id = {PH}", (OWNER_ID,))
     has_owner = cursor.fetchone() is not None
-    conn.close()
+    _release(conn)
     return db_count if has_owner else db_count + 1
 
 
-# ==================== APP USERS TRACKING ====================
+# ==================== USERS ====================
 
 def register_or_update_user(user_id: str, client_ip: str = "", app_version: str = "") -> bool:
     if not user_id or not user_id.strip():
@@ -290,8 +347,8 @@ def register_or_update_user(user_id: str, client_ip: str = "", app_version: str 
                 app_version = excluded.app_version,
                 last_seen = CURRENT_TIMESTAMP
             """, (user_id, client_ip, app_version))
-        conn.commit()
-        conn.close()
+        _commit(conn)
+        _release(conn)
         return True
     except Exception as e:
         print(f"[DB] register_user error: {e}")
@@ -303,8 +360,8 @@ def get_users_count() -> int:
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM users")
     row = cursor.fetchone()
-    count = row[0] if DB_TYPE == "postgres" else row["count"]
-    conn.close()
+    count = row[0]
+    _release(conn)
     return count
 
 
@@ -316,7 +373,7 @@ def get_all_users(limit: int = 100) -> List[Dict[str, Any]]:
         (limit,)
     )
     result = _fetch_all(cursor)
-    conn.close()
+    _release(conn)
     return result
 
 
@@ -325,22 +382,19 @@ def get_system_stats() -> Dict[str, Any]:
     cursor = conn.cursor()
 
     cursor.execute("SELECT COUNT(*) FROM users")
-    row = cursor.fetchone()
-    total_users = row[0] if DB_TYPE == "postgres" else row["c"]
+    total_users = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM servers")
-    row = cursor.fetchone()
-    total_servers = row[0] if DB_TYPE == "postgres" else row["c"]
+    total_servers = cursor.fetchone()[0]
 
     cursor.execute("SELECT COUNT(*) FROM admins")
-    row = cursor.fetchone()
-    admin_count = row[0] if DB_TYPE == "postgres" else row["c"]
+    admin_count = cursor.fetchone()[0]
 
     cursor.execute(f"SELECT 1 FROM admins WHERE telegram_id = {PH}", (OWNER_ID,))
     if not cursor.fetchone():
         admin_count += 1
 
-    conn.close()
+    _release(conn)
 
     return {
         "total_users": total_users,
