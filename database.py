@@ -2,7 +2,8 @@ import os
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from config import OWNER_ID
-
+import psycopg
+from psycopg.rows import dict_row
 # ==================== DATABASE CONNECTION ====================
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
