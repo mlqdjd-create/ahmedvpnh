@@ -1,19 +1,18 @@
 import os
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+from urllib.parse import urlparse
 from config import OWNER_ID
-import psycopg
-from psycopg.rows import dict_row
+
 # ==================== DATABASE CONNECTION ====================
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if DATABASE_URL:
-    # ✅ استخدام PostgreSQL (Supabase)
-    import psycopg2
-    import psycopg2.extras
+    # ✅ استخدام PostgreSQL (Supabase) عبر pg8000
+    import pg8000.dbapi as pg8000
     DB_TYPE = "postgres"
-    print("[DB] ✅ Using PostgreSQL (Supabase)")
+    print("[DB] ✅ Using PostgreSQL (Supabase) via pg8000")
 else:
     # ⚠️ Fallback محلي (SQLite)
     import sqlite3
@@ -27,7 +26,15 @@ PH = "%s" if DB_TYPE == "postgres" else "?"
 
 def get_connection():
     if DB_TYPE == "postgres":
-        conn = psycopg2.connect(DATABASE_URL)
+        # pg8000 مع URL parsing
+        url = urlparse(DATABASE_URL)
+        conn = pg8000.connect(
+            user=url.username,
+            password=url.password,
+            host=url.hostname,
+            port=url.port or 5432,
+            database=url.path.lstrip("/"),
+        )
         return conn
     else:
         conn = sqlite3.connect(str(DB_FILE), check_same_thread=False)
@@ -61,7 +68,6 @@ def init_db():
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Servers table
     if DB_TYPE == "postgres":
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS servers (
@@ -90,7 +96,6 @@ def init_db():
         )
         """)
     else:
-        # SQLite
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS servers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -179,7 +184,7 @@ def delete_server(server_id: int) -> bool:
 def get_servers_count() -> int:
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) as count FROM servers")
+    cursor.execute("SELECT COUNT(*) FROM servers")
     row = cursor.fetchone()
     count = row[0] if DB_TYPE == "postgres" else row["count"]
     conn.close()
@@ -249,7 +254,7 @@ def get_all_admins() -> List[Dict[str, Any]]:
 def get_admins_count() -> int:
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) as count FROM admins")
+    cursor.execute("SELECT COUNT(*) FROM admins")
     row = cursor.fetchone()
     db_count = row[0] if DB_TYPE == "postgres" else row["count"]
     cursor.execute(f"SELECT 1 FROM admins WHERE telegram_id = {PH}", (OWNER_ID,))
@@ -296,7 +301,7 @@ def register_or_update_user(user_id: str, client_ip: str = "", app_version: str 
 def get_users_count() -> int:
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) as count FROM users")
+    cursor.execute("SELECT COUNT(*) FROM users")
     row = cursor.fetchone()
     count = row[0] if DB_TYPE == "postgres" else row["count"]
     conn.close()
