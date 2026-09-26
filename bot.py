@@ -79,6 +79,63 @@ def get_flag_for_name(name: str) -> str:
     return "🌐"
 
 
+# ==================== COUNTRIES ====================
+# الدول المتاحة عند إضافة سيرفر — تُخزن مع السيرفر وتظهر للتطبيق
+COUNTRIES = {
+    "iq": ("🇮🇶", "العراق"),
+    "ae": ("🇦🇪", "الإمارات"),
+    "sa": ("🇸🇦", "السعودية"),
+    "tr": ("🇹🇷", "تركيا"),
+    "de": ("🇩🇪", "ألمانيا"),
+    "nl": ("🇳🇱", "هولندا"),
+    "fr": ("🇫🇷", "فرنسا"),
+    "gb": ("🇬🇧", "بريطانيا"),
+    "us": ("🇺🇸", "أمريكا"),
+    "sg": ("🇸🇬", "سنغافورة"),
+    "ca": ("🇨🇦", "كندا"),
+}
+
+
+def get_country_label(code: str) -> str:
+    """يعيد نص الدولة مع علمها، أو نص بدون دولة."""
+    c = COUNTRIES.get((code or "").lower())
+    if not c:
+        return "🌐 بدون دولة"
+    return f"{c[0]} {c[1]}"
+
+
+def get_flag_from_country(country_field: str) -> str:
+    """يستخرج العلم من حقل الدولة المخزن (مثل '🇮🇶 العراق')."""
+    if country_field:
+        for c in COUNTRIES.values():
+            if c[0] in country_field:
+                return c[0]
+    return ""
+
+
+def get_country_keyboard():
+    """لوحة أزرار اختيار الدولة — صفّان لكل زر."""
+    rows = []
+    codes = list(COUNTRIES.keys())
+    for i in range(0, len(codes), 2):
+        row = []
+        for code in codes[i:i + 2]:
+            flag, cname = COUNTRIES[code]
+            row.append(InlineKeyboardButton(f"{flag} {cname}", callback_data=f"set_country_{code}"))
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("🌐 بدون دولة", callback_data="set_country_none"),
+        InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def get_server_flag(server: dict) -> str:
+    """علم السيرفر: من حقل الدولة أولاً، ثم من الاسم."""
+    flag = get_flag_from_country(server.get("country", ""))
+    return flag or get_flag_for_name(server.get("name", ""))
+
+
 def get_main_menu_keyboard(is_super_owner: bool = False):
     keyboard = [
         [
@@ -254,6 +311,51 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"start_command error: {e}", exc_info=True)
 
 
+# ==================== ADD SERVER FINALIZE ====================
+
+def add_server_finalize(user_id: int) -> str:
+    """يحفظ السيرفر مع الدولة/البايلود/البروكسي من الجلسة ويعيد ملخصاً."""
+    session = SESSIONS.pop(user_id, None)
+    if not session:
+        return "⚠️ انتهت الجلسة. أعد من البداية."
+
+    d = session.get("data", {})
+    name = d.get("name", "Server")
+    proto = d.get("protocol", "VLESS")
+    country = d.get("country", "")
+    payload = d.get("payload", "")
+    proxy_host = d.get("proxy_host", "")
+    proxy_port = d.get("proxy_port", "")
+    proxy_user = d.get("proxy_user", "")
+    proxy_pass = d.get("proxy_pass", "")
+    config_link = d.get("config", "")
+
+    sid = database.add_server(
+        name=name, protocol=proto, config=config_link,
+        country=country, payload=payload,
+        proxy_host=proxy_host, proxy_port=proxy_port,
+        proxy_user=proxy_user, proxy_pass=proxy_pass,
+    )
+
+    country_label = country if country else "🌐 بدون دولة"
+    payload_line = "✍️ البايلود: ✓ مضاف" if payload else "✍️ البايلود: — بدون"
+    if proxy_host:
+        proxy_line = f"🛰️ البروكسي: ✓ {esc(proxy_host)}:{esc(proxy_port)}" + (" 🔐" if proxy_user else "")
+    else:
+        proxy_line = "🛰️ البروكسي: — بدون"
+
+    return (
+        f"✅ <b>تم حفظ السيرفر</b>\n\n"
+        f"• ID: {code(sid)}\n"
+        f"• الاسم: <b>{esc(name)}</b>\n"
+        f"• الدولة: <b>{esc(country_label)}</b>\n"
+        f"• البروتوكول: {code(proto)}\n"
+        f"{payload_line}\n"
+        f"{proxy_line}\n\n"
+        f"📥 سيظهر في التطبيق عند التحديث."
+    )
+
+
 # ==================== CALLBACKS ====================
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -310,9 +412,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "menu_add_server":
             SESSIONS[user.id] = {"action": "add_server", "step": "name", "data": {}}
             text = (
-                "➕ <b>إضافة سيرفر جديد (1/3)</b>\n\n"
+                "➕ <b>إضافة سيرفر جديد (1/7)</b>\n\n"
                 "أرسل الآن <b>اسم السيرفر</b>:\n"
-                "<i>(مثال: Germany 01)</i>\n\n"
+                "<i>(مثال: Iraq 01)</i>\n\n"
                 "💡 أو أرسل رابط مباشر (<code>vless://...</code>, "
                 "<code>vmess://...</code>, <code>trojan://...</code>)"
             )
@@ -324,14 +426,78 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session = SESSIONS.get(user.id)
             if session and session.get("action") == "add_server":
                 session["data"]["protocol"] = proto
-                session["step"] = "config"
+                session["step"] = "country"
                 text = (
                     f"✅ البروتوكول: {code(proto)}\n\n"
-                    f"🔗 <b>الخطوة 3 من 3</b>\n"
+                    f"🌍 <b>الخطوة 3 من 7 — اختر الدولة</b>\n"
+                    f"ستظهر الدولة بعلمها داخل التطبيق:"
+                )
+                await safe_edit(query, text, get_country_keyboard())
+            else:
+                await safe_edit(query, "⚠️ انتهت الجلسة. أعد من البداية.", get_main_menu_keyboard(is_super))
+
+        # ---------- اختيار الدولة (أزرار) ----------
+        elif data.startswith("set_country_"):
+            session = SESSIONS.get(user.id)
+            if session and session.get("action") == "add_server" and session.get("step") == "country":
+                code_c = data.replace("set_country_", "")
+                if code_c == "none":
+                    session["data"]["country"] = ""
+                    label = "🌐 بدون دولة"
+                else:
+                    session["data"]["country"] = get_country_label(code_c)
+                    label = session["data"]["country"]
+                proto = session["data"].get("protocol", "VLESS")
+                session["step"] = "config"
+                text = (
+                    f"✅ الدولة: <b>{esc(label)}</b>\n\n"
+                    f"🔗 <b>الخطوة 4 من 7</b>\n"
                     f"أرسل الآن <b>رابط السيرفر</b> (يبدأ بـ {code(proto.lower() + '://')}):"
                 )
                 keyboard = [[InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")]]
                 await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+            else:
+                await safe_edit(query, "⚠️ انتهت الجلسة. أعد من البداية.", get_main_menu_keyboard(is_super))
+
+        # ---------- أزرار التخطي (بايلود / بروكسي / بيانات البروكسي) ----------
+        elif data == "add_skip_payload":
+            session = SESSIONS.get(user.id)
+            if session and session.get("action") == "add_server" and session.get("step") == "payload":
+                session["data"]["payload"] = ""
+                session["step"] = "proxy"
+                text = (
+                    "⏭️ بدون بايلود\n\n"
+                    "🛰️ <b>الخطوة 6 من 7 — البروكسي (اختياري)</b>\n\n"
+                    "أرسل البروكسي بصيغة <code>host:port</code>\n"
+                    "<i>(نوعه — HTTP / SOCKS — يتعرف عليه التطبيق تلقائياً)</i>"
+                )
+                keyboard = [
+                    [InlineKeyboardButton("⏭️ بدون بروكسي", callback_data="add_skip_proxy")],
+                    [InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")],
+                ]
+                await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+            else:
+                await safe_edit(query, "⚠️ انتهت الجلسة. أعد من البداية.", get_main_menu_keyboard(is_super))
+
+        elif data == "add_skip_proxy":
+            session = SESSIONS.get(user.id)
+            if session and session.get("action") == "add_server" and session.get("step") == "proxy":
+                session["data"]["proxy_host"] = ""
+                session["data"]["proxy_port"] = ""
+                session["data"]["proxy_user"] = ""
+                session["data"]["proxy_pass"] = ""
+                sid = add_server_finalize(user.id)
+                await safe_edit(query, sid, get_main_menu_keyboard(is_super))
+            else:
+                await safe_edit(query, "⚠️ انتهت الجلسة. أعد من البداية.", get_main_menu_keyboard(is_super))
+
+        elif data == "add_skip_auth":
+            session = SESSIONS.get(user.id)
+            if session and session.get("action") == "add_server" and session.get("step") == "proxyauth":
+                session["data"]["proxy_user"] = ""
+                session["data"]["proxy_pass"] = ""
+                sid = add_server_finalize(user.id)
+                await safe_edit(query, sid, get_main_menu_keyboard(is_super))
             else:
                 await safe_edit(query, "⚠️ انتهت الجلسة. أعد من البداية.", get_main_menu_keyboard(is_super))
 
@@ -350,12 +516,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # نعرض 10 سيرفرات فقط لتجنب تجاوز حد الرسالة
             text = f"📋 <b>السيرفرات المتاحة ({len(servers)} سيرفر):</b>\n\n"
             for s in servers[:10]:
-                flag = get_flag_for_name(s["name"])
+                flag = get_server_flag(s)
+                has_payload = "✓" if (s.get("payload") or "").strip() else "—"
+                has_proxy = "✓" if (s.get("proxy_host") or "").strip() else "—"
                 text += (
                     f"━━━━━━━━━━━━━━━━━━━\n"
                     f"🔹 ID: {code(s['id'])}\n"
                     f"🏷️ {flag} <b>{esc(s['name'])}</b>\n"
-                    f"⚡ {code(s['protocol'])}\n"
+                    f"⚡ {code(s['protocol'])}  |  🌍 {esc(s.get('country') or 'بدون')}\n"
+                    f"✍️ بايلود: {has_payload}  |  🛰️ بروكسي: {has_proxy}\n"
                 )
             if len(servers) > 10:
                 text += f"\n<i>... و {len(servers) - 10} سيرفر إضافي</i>"
@@ -385,7 +554,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             keyboard = []
             for s in current_page:
-                flag = get_flag_for_name(s["name"])
+                flag = get_server_flag(s)
                 label = f"🗑️ {flag} {s['name'][:25]} ({s['protocol']})"
                 keyboard.append([
                     InlineKeyboardButton(
@@ -415,7 +584,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_edit(query, "السيرفر غير موجود.", get_main_menu_keyboard(is_super))
                 return
 
-            flag = get_flag_for_name(server["name"])
+            flag = get_server_flag(server)
             text = (
                 f"⚠️ <b>تأكيد الحذف</b>\n\n"
                 f"هل تريد حذف السيرفر:\n"
@@ -631,7 +800,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 session["step"] = "protocol"
                 prompt = (
                     f"🏷️ الاسم: <b>{esc(text[:60])}</b>\n\n"
-                    f"⚡ <b>الخطوة 2 من 3</b>\nاختر البروتوكول:"
+                    f"⚡ <b>الخطوة 2 من 7</b>\nاختر البروتوكول:"
                 )
                 keyboard = [
                     [
@@ -645,31 +814,87 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
 
             elif step == "config":
-                proto = session["data"].get("protocol", "VLESS")
-                name = session["data"].get("name", "Server")
-                config_link = text
-
-                try:
-                    sid = database.add_server(name=name, protocol=proto, config=config_link)
-                    SESSIONS.pop(user.id, None)
-
-                    flag = get_flag_for_name(name)
-                    reply = (
-                        f"✅ <b>تم حفظ السيرفر</b>\n\n"
-                        f"• ID: {code(sid)}\n"
-                        f"• الاسم: {flag} <b>{esc(name)}</b>\n"
-                        f"• البروتوكول: {code(proto)}"
+                proto = session["data"].get("protocol", "VLESS").lower()
+                if not text.lower().startswith(proto + "://"):
+                    await safe_reply(
+                        update.message,
+                        f"❌ الرابط يجب أن يبدأ بـ {code(proto + '://')}\nأرسله مرة أخرى:",
                     )
-                    keyboard = [
-                        [InlineKeyboardButton("➕ إضافة آخر", callback_data="menu_add_server")],
-                        [InlineKeyboardButton("📋 عرض", callback_data="menu_list_servers")],
-                        [InlineKeyboardButton("🔙 القائمة", callback_data="menu_main")]
-                    ]
-                    await safe_reply(update.message, reply, InlineKeyboardMarkup(keyboard))
-                except Exception as e:
-                    logger.error(f"add_server error: {e}")
-                    SESSIONS.pop(user.id, None)
-                    await safe_reply(update.message, "⚠️ فشل حفظ السيرفر.")
+                    return
+                session["data"]["config"] = text
+                session["step"] = "payload"
+                prompt = (
+                    f"🔗 الرابط: <b>تم استلامه ✓</b>\n\n"
+                    f"✍️ <b>الخطوة 5 من 7 — البايلود (اختياري)</b>\n\n"
+                    f"أرسل نص البايلود كما هو، مثال:\n"
+                    f"<code>GET http://example.com/ HTTP/1.1</code>\n"
+                    f"<code>Host: example.com</code>"
+                )
+                keyboard = [
+                    [InlineKeyboardButton("⏭️ بدون بايلود", callback_data="add_skip_payload")],
+                    [InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")],
+                ]
+                await safe_reply(update.message, prompt, InlineKeyboardMarkup(keyboard))
+                return
+
+            elif step == "payload":
+                session["data"]["payload"] = text
+                session["step"] = "proxy"
+                prompt = (
+                    "✍️ البايلود: <b>تم الحفظ ✓</b>\n\n"
+                    "🛰️ <b>الخطوة 6 من 7 — البروكسي (اختياري)</b>\n\n"
+                    "أرسل البروكسي بصيغة <code>host:port</code>\n"
+                    "<i>(نوعه — HTTP / SOCKS — يتعرف عليه التطبيق تلقائياً)</i>"
+                )
+                keyboard = [
+                    [InlineKeyboardButton("⏭️ بدون بروكسي", callback_data="add_skip_proxy")],
+                    [InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")],
+                ]
+                await safe_reply(update.message, prompt, InlineKeyboardMarkup(keyboard))
+                return
+
+            elif step == "proxy":
+                import re as _re
+                m = _re.match(r"^\s*([\w.\-]+)\s*[: ]\s*(\d{1,5})\s*$", text)
+                if not m:
+                    await safe_reply(
+                        update.message,
+                        "❌ صيغة غير صحيحة!\nأرسل البروكسي بصيغة <code>host:port</code> فقط،"
+                        " أو اضغط ⏭️ بدون بروكسي.",
+                    )
+                    return
+                session["data"]["proxy_host"] = m.group(1)
+                session["data"]["proxy_port"] = m.group(2)
+                session["step"] = "proxyauth"
+                prompt = (
+                    f"🛰️ البروكسي: <b>{esc(m.group(1))}:{m.group(2)} ✓</b>\n\n"
+                    f"🔐 <b>الخطوة 7 من 7 — بيانات البروكسي (اختياري)</b>\n\n"
+                    f"أرسلها بصيغة <code>user:pass</code> — أو تخطَّ إذا كان البروكسي بدون كلمة مرور."
+                )
+                keyboard = [
+                    [InlineKeyboardButton("⏭️ بدون بيانات", callback_data="add_skip_auth")],
+                    [InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")],
+                ]
+                await safe_reply(update.message, prompt, InlineKeyboardMarkup(keyboard))
+                return
+
+            elif step == "proxyauth":
+                if ":" not in text:
+                    await safe_reply(
+                        update.message,
+                        "❌ صيغة غير صحيحة!\nأرسلها بصيغة <code>user:pass</code> — أو اضغط ⏭️ بدون بيانات.",
+                    )
+                    return
+                user_part, pass_part = text.split(":", 1)
+                session["data"]["proxy_user"] = user_part.strip()
+                session["data"]["proxy_pass"] = pass_part.strip()
+                reply = add_server_finalize(user.id)
+                keyboard = [
+                    [InlineKeyboardButton("➕ إضافة آخر", callback_data="menu_add_server")],
+                    [InlineKeyboardButton("📋 عرض", callback_data="menu_list_servers")],
+                    [InlineKeyboardButton("🔙 القائمة", callback_data="menu_main")]
+                ]
+                await safe_reply(update.message, reply, InlineKeyboardMarkup(keyboard))
                 return
 
         # fallback

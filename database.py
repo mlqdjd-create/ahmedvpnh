@@ -98,6 +98,12 @@ def init_db():
             name TEXT NOT NULL,
             protocol TEXT NOT NULL,
             config TEXT NOT NULL,
+            country TEXT DEFAULT '',
+            payload TEXT DEFAULT '',
+            proxy_host TEXT DEFAULT '',
+            proxy_port TEXT DEFAULT '',
+            proxy_user TEXT DEFAULT '',
+            proxy_pass TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
@@ -148,28 +154,76 @@ def init_db():
         )
         """)
 
+    # ترقية قواعد البيانات القديمة: إضافة أعمدة الدولة والبايلود والبروكسي
+    # بدون فقدان أي سيرفرات موجودة
+    try:
+        new_cols = [
+            "country TEXT DEFAULT ''",
+            "payload TEXT DEFAULT ''",
+            "proxy_host TEXT DEFAULT ''",
+            "proxy_port TEXT DEFAULT ''",
+            "proxy_user TEXT DEFAULT ''",
+            "proxy_pass TEXT DEFAULT ''",
+        ]
+        if DB_TYPE == "postgres":
+            for c in new_cols:
+                cursor.execute(f"ALTER TABLE servers ADD COLUMN IF NOT EXISTS {c}")
+        else:
+            cursor.execute("PRAGMA table_info(servers)")
+            existing = {row[1] for row in cursor.fetchall()}
+            for c in new_cols:
+                col = c.split()[0]
+                if col not in existing:
+                    cursor.execute(f"ALTER TABLE servers ADD COLUMN {c}")
+    except Exception as e:
+        print(f"[DB] ⚠️ migration skipped: {e}")
+
     _commit(conn)
     _release(conn)
-    print(f"[DB] ✅ Tables initialized ({DB_TYPE})")
+    print(f"[DB] ✅ Tables initialized + country/payload/proxy columns ({DB_TYPE})")
 
 
 # ==================== SERVERS ====================
 
-def add_server(name: str, protocol: str, config: str) -> int:
+def add_server(
+    name: str,
+    protocol: str,
+    config: str,
+    country: str = "",
+    payload: str = "",
+    proxy_host: str = "",
+    proxy_port: str = "",
+    proxy_user: str = "",
+    proxy_pass: str = "",
+) -> int:
+    """يضيف سيرفر مع دولة وبايلود وبروكسي اختيارية مرتبطة به."""
     conn = get_connection()
     cursor = conn.cursor()
     try:
+        cols = "name, protocol, config, country, payload, proxy_host, proxy_port, proxy_user, proxy_pass"
+        vals = (
+            name.strip(),
+            protocol.strip().upper(),
+            config.strip(),
+            (country or "").strip(),
+            (payload or "").strip(),
+            (proxy_host or "").strip(),
+            (proxy_port or "").strip(),
+            (proxy_user or "").strip(),
+            (proxy_pass or "").strip(),
+        )
+        phs = ", ".join([PH] * len(vals))
         if DB_TYPE == "postgres":
             cursor.execute(
-                f"INSERT INTO servers (name, protocol, config) VALUES ({PH}, {PH}, {PH}) RETURNING id",
-                (name.strip(), protocol.strip().upper(), config.strip())
+                f"INSERT INTO servers ({cols}) VALUES ({phs}) RETURNING id",
+                vals
             )
             row = cursor.fetchone()
             new_id = row[0]
         else:
             cursor.execute(
-                f"INSERT INTO servers (name, protocol, config) VALUES ({PH}, {PH}, {PH})",
-                (name.strip(), protocol.strip().upper(), config.strip())
+                f"INSERT INTO servers ({cols}) VALUES ({phs})",
+                vals
             )
             new_id = cursor.lastrowid
         _commit(conn)
@@ -182,7 +236,7 @@ def get_all_servers() -> List[Dict[str, Any]]:
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT id, name, protocol, config, created_at FROM servers ORDER BY id DESC")
+        cursor.execute("SELECT id, name, protocol, config, country, payload, proxy_host, proxy_port, proxy_user, proxy_pass, created_at FROM servers ORDER BY id DESC")
         return _fetch_all(cursor)
     finally:
         _release(conn)
@@ -193,7 +247,7 @@ def get_server_by_id(server_id: int) -> Optional[Dict[str, Any]]:
     cursor = conn.cursor()
     try:
         cursor.execute(
-            f"SELECT id, name, protocol, config, created_at FROM servers WHERE id = {PH}",
+            f"SELECT id, name, protocol, config, country, payload, proxy_host, proxy_port, proxy_user, proxy_pass, created_at FROM servers WHERE id = {PH}",
             (server_id,)
         )
         return _fetch_one(cursor)

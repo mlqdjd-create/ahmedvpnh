@@ -25,6 +25,13 @@ class ServerCreate(BaseModel):
     name: str
     protocol: str
     config: str
+    # ميزات اختيارية لكل سيرفر: الدولة + البايلود + البروكسي
+    country: str = ""
+    payload: str = ""
+    proxy_host: str = ""
+    proxy_port: str = ""
+    proxy_user: str = ""
+    proxy_pass: str = ""
 
 class UserPing(BaseModel):
     user_id: str
@@ -88,34 +95,43 @@ def ping_user(data: UserPing, request: Request):
         "total_users": database.get_users_count()
     }
 
+def _server_payload(s, with_timestamp: bool = False):
+    """صيغة السيرفر كما يتوقعها تطبيق الأندرويد — تتضمن الدولة والبايلود والبروكسي."""
+    out = {
+        "id": s["id"],
+        "name": s["name"],
+        "protocol": s["protocol"],
+        "config": s["config"],
+        "country": s.get("country", ""),
+        "payload": s.get("payload", ""),
+        "proxy_host": s.get("proxy_host", ""),
+        "proxy_port": s.get("proxy_port", ""),
+        "proxy_user": s.get("proxy_user", ""),
+        "proxy_pass": s.get("proxy_pass", ""),
+    }
+    if with_timestamp:
+        out["created_at"] = s["created_at"]
+    return out
+
+
 @app.get("/api/servers")
 def get_servers():
     """
-    Returns servers list in exact format expected by AHMED VPN Android app.
+    Returns servers list in exact format expected by AHMED VPN Android app
+    (includes optional per-server country, payload and proxy).
     """
     servers = database.get_all_servers()
-    result = []
-    for s in servers:
-        result.append({
-            "id": s["id"],
-            "name": s["name"],
-            "protocol": s["protocol"],
-            "config": s["config"]
-        })
+    result = [_server_payload(s) for s in servers]
     return {"servers": result}
+
 
 @app.get("/api/servers/{server_id}")
 def get_single_server(server_id: int):
     server = database.get_server_by_id(server_id)
     if not server:
         raise HTTPException(status_code=404, detail="Server not found")
-    return {
-        "id": server["id"],
-        "name": server["name"],
-        "protocol": server["protocol"],
-        "config": server["config"],
-        "created_at": server["created_at"]
-    }
+    return _server_payload(server, with_timestamp=True)
+
 
 @app.post("/api/servers", dependencies=[Depends(verify_admin_key)])
 def create_server(data: ServerCreate):
@@ -127,7 +143,13 @@ def create_server(data: ServerCreate):
     server_id = database.add_server(
         name=data.name,
         protocol=proto,
-        config=data.config
+        config=data.config,
+        country=data.country,
+        payload=data.payload,
+        proxy_host=data.proxy_host,
+        proxy_port=data.proxy_port,
+        proxy_user=data.proxy_user,
+        proxy_pass=data.proxy_pass,
     )
     return {
         "status": "success",
