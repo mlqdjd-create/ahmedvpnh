@@ -447,14 +447,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     session["data"]["country"] = get_country_label(code_c)
                     label = session["data"]["country"]
-                proto = session["data"].get("protocol", "VLESS")
-                session["step"] = "config"
-                text = (
-                    f"✅ الدولة: <b>{esc(label)}</b>\n\n"
-                    f"🔗 <b>الخطوة 4 من 7</b>\n"
-                    f"أرسل الآن <b>رابط السيرفر</b> (يبدأ بـ {code(proto.lower() + '://')}):"
-                )
-                keyboard = [[InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")]]
+                if session["data"].get("config"):
+                    # رابط مباشر: الرابط موجود أصلاً — انتقل للبايلود مباشرة
+                    session["step"] = "payload"
+                    text = (
+                        f"✅ الدولة: <b>{esc(label)}</b>\n\n"
+                        f"✍️ <b>الخطوة 5 من 7 — البايلود (اختياري)</b>\n\n"
+                        f"أرسل نص البايلود كما هو، مثال:\n"
+                        f"<code>GET http://example.com/ HTTP/1.1</code>\n"
+                        f"<code>Host: example.com</code>"
+                    )
+                    keyboard = [
+                        [InlineKeyboardButton("⏭️ بدون بايلود", callback_data="add_skip_payload")],
+                        [InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")],
+                    ]
+                else:
+                    proto = session["data"].get("protocol", "VLESS")
+                    session["step"] = "config"
+                    text = (
+                        f"✅ الدولة: <b>{esc(label)}</b>\n\n"
+                        f"🔗 <b>الخطوة 4 من 7</b>\n"
+                        f"أرسل الآن <b>رابط السيرفر</b> (يبدأ بـ {code(proto.lower() + '://')}):"
+                    )
+                    keyboard = [[InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")]]
                 await safe_edit(query, text, InlineKeyboardMarkup(keyboard))
             else:
                 await safe_edit(query, "⚠️ انتهت الجلسة. أعد من البداية.", get_main_menu_keyboard(is_super))
@@ -726,15 +741,48 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
         # 1) روابط مباشرة
         if text.startswith(("vless://", "vmess://", "trojan://")):
-            lines = text.splitlines()
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+            # --- رابط واحد: معالج كامل (الدولة ← البايلود ← البروكسي) ---
+            if len(lines) == 1:
+                line = lines[0]
+                proto = "VLESS" if line.startswith("vless://") else (
+                    "VMESS" if line.startswith("vmess://") else "TROJAN"
+                )
+                name = f"Server {database.get_servers_count() + 1}"
+                if "#" in line:
+                    try:
+                        remark = unquote(line.split("#")[-1]).strip()
+                        if remark:
+                            name = remark[:60]
+                    except Exception:
+                        pass
+
+                SESSIONS[user.id] = {
+                    "action": "add_server",
+                    "step": "country",
+                    "data": {
+                        "name": name,
+                        "protocol": proto,
+                        "config": line,
+                        "direct": True,
+                    },
+                }
+                reply = (
+                    "✅ <b>تم استلام الرابط ✓</b>\n\n"
+                    f"🏷️ الاسم: <b>{esc(name)}</b>\n"
+                    f"⚡ البروتوكول: {code(proto)}\n\n"
+                    f"🌍 <b>اختر الدولة</b> — ستظهر بعلمها في التطبيق:"
+                )
+                await safe_reply(update.message, reply, get_country_keyboard())
+                return
+
+            # --- عدة روابط: تُحفظ مباشرة بدون إضافات ---
             added = 0
             last_name = "Server"
             proto = "VLESS"
 
             for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
                 proto = "VLESS" if line.startswith("vless://") else (
                     "VMESS" if line.startswith("vmess://") else "TROJAN"
                 )
@@ -757,7 +805,8 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             reply = (
                 f"✅ <b>تمت إضافة {added} سيرفر</b> 🚀\n\n"
                 f"• آخر سيرفر: {flag} <b>{esc(last_name)}</b>\n"
-                f"• البروتوكول: {code(proto)}"
+                f"• البروتوكول: {code(proto)}\n\n"
+                f"💡 لإضافة دولة وبايلود وبروكسي لسيرفر معين، أرسل رابطه <b>وحده</b>."
             )
             keyboard = [
                 [InlineKeyboardButton("📋 عرض", callback_data="menu_list_servers")],
