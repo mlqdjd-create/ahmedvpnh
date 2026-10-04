@@ -1,4 +1,6 @@
+import secrets
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -84,6 +86,21 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+        """)
+        # روابط الاشتراك المدفوعة: كل توكن = مستخدم واحد، له تاريخ انتهاء
+        # ويمكن ربطه بسيرفرات محددة (server_ids فارغ = كل السيرفرات).
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT UNIQUE NOT NULL,
+            label TEXT DEFAULT '',
+            note TEXT DEFAULT '',
+            server_ids TEXT DEFAULT '',
+            expires_at TIMESTAMP,
+            active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_used TIMESTAMP
         )
         """)
         conn.commit()
@@ -294,6 +311,89 @@ def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
         cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
         row = cursor.fetchone()
         return row["value"] if row else default
+    finally:
+        conn.close()
+
+
+# ============================ SUBSCRIPTIONS ============================
+# روابط الاشتراك المدفوعة: كل توكن يمثّل مستخدمًا واحدًا، له تاريخ انتهاء
+# ويمكن ربطه بسيرفرات محددة. المستخدم يستلم رابطًا واحدًا (/sub/<token>)
+# يستعمله في أي تطبيق v2ray و يتحدّث تلقائيًا عند إضافة/حذف السيرفرات.
+
+def create_subscription(label: str, days: int = 0,
+                        server_ids: str = "", note: str = "") -> Dict[str, Any]:
+    """ينشئ توكن اشتراك جديد. days=0 يعني بلا انتهاء. server_ids نص مفصول
+    بفواصل (فارغ = كل السيرفرات)."""
+    token = secrets.token_urlsafe(24)
+    expires = None
+    if days and int(days) > 0:
+        expires = (datetime.now() + timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO subscriptions (token, label, expires_at, server_ids, note, active)
+               VALUES (?, ?, ?, ?, ?, 1)""",
+            (token, (label or "").strip(), expires,
+             (server_ids or "").strip(), (note or "").strip()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"token": token, "label": label, "expires_at": expires,
+            "server_ids": (server_ids or "").strip()}
+
+
+def get_subscription(token: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM subscriptions WHERE token = ?", (token,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_subscriptions() -> List[Dict[str, Any]]:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM subscriptions ORDER BY id DESC")
+        return [dict(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def set_subscription_active(token: str, active: bool) -> bool:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE subscriptions SET active = ? WHERE token = ?",
+                       (1 if active else 0, token))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def delete_subscription(token: str) -> bool:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM subscriptions WHERE token = ?", (token,))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def touch_subscription(token: str) -> None:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE subscriptions SET last_used = CURRENT_TIMESTAMP WHERE token = ?", (token,))
+        conn.commit()
     finally:
         conn.close()
 

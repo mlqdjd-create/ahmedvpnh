@@ -17,6 +17,14 @@ except ValueError:
 
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", 8080))
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+
+def public_base() -> str:
+    """رابط الأساس العام لروابط الاشتراك (PUBLIC_BASE_URL أو host:port)."""
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    return f"http://{HOST}:{PORT}"
 
 from telegram import (
     Update,
@@ -66,6 +74,9 @@ def get_main_menu_keyboard():
         ],
         [
             InlineKeyboardButton("🧩 بروكسي/بايلود لسيرفر", callback_data="menu_advanced_0")
+        ],
+        [
+            InlineKeyboardButton("🔗 روابط الاشتراك المدفوعة", callback_data="menu_subs")
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -122,6 +133,46 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_main_menu_keyboard(),
         parse_mode="Markdown"
     )
+
+
+def sub_picker_view(session, page=0):
+    """يبني (النص، الكيبورد) لاختيار السيرفرات بالضغط داخل رابط الاشتراك."""
+    servers = database.get_all_servers()
+    if not servers:
+        text = "⚠️ **لا توجد سيرفرات بعد.** أضف سيرفرات أولًا ثم أنشئ رابط اشتراك."
+        keyboard = [[InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")]]
+        return text, InlineKeyboardMarkup(keyboard)
+    selected = set(session["data"].get("selected", []))
+    per_page = 8
+    total = len(servers)
+    page = max(0, min(page, (total - 1) // per_page))
+    start = page * per_page
+    end = min(start + per_page, total)
+    keyboard = []
+    for s in servers[start:end]:
+        mark = "☑️" if s["id"] in selected else "☐"
+        keyboard.append([InlineKeyboardButton(
+            f"{mark} {get_flag_for_name(s['name'])} {s['name']}",
+            callback_data=f"sub_tog_{s['id']}_{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"sub_sel_{page - 1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"sub_sel_{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([
+        InlineKeyboardButton("☑️ تحديد الكل", callback_data=f"sub_all_{page}"),
+        InlineKeyboardButton("⬜ مسح", callback_data=f"sub_none_{page}"),
+    ])
+    keyboard.append([InlineKeyboardButton("✅ إنشاء الرابط", callback_data="sub_confirm")])
+    keyboard.append([InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")])
+    text = (
+        "🌐 **اختر السيرفرات** التي تريد إضافتها لهذا المستخدم:\n"
+        f"(المحدد: **{len(selected)}** من {total})\n\n"
+        "اضغط على السيرفر لتحديده/إلغائه، ثم «✅ إنشاء الرابط»."
+    )
+    return text, InlineKeyboardMarkup(keyboard)
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -314,6 +365,194 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🧩 **{server['name']}**\n\nأرسل **البروكسي** بصيغة `host:port`\n(أو أرسل `-` لتخطي البروكسي ومسحه):",
             reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+    # ---------- Subscriptions ----------
+    elif data == "menu_subs":
+        SESSIONS.pop(user_id, None)
+        text = (
+            "🔗 **روابط الاشتراك المدفوعة**\n\n"
+            "كل رابط = مستخدم محدد، وله تاريخ انتهاء. الرابط يشتغل في أي\n"
+            "تطبيق v2ray و يتحدّث تلقائيًا مع سيرفراتك.\n\n"
+            "اختر:"
+        )
+        keyboard = [
+            [InlineKeyboardButton("➕ إنشاء رابط اشتراك", callback_data="sub_create")],
+            [InlineKeyboardButton("📋 عرض الروابط", callback_data="sub_list")],
+            [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "sub_create":
+        SESSIONS[user_id] = {"mode": "sub", "step": "label", "data": {}}
+        text = (
+            "➕ **إنشاء رابط اشتراك (الخطوة 1 من 3):**\n\n"
+            "أرسل **اسم/ملاحظة للمستخدم** (مثال: أحمد — شهر 10):"
+        )
+        keyboard = [[InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "sub_list":
+        subs = database.list_subscriptions()
+        if not subs:
+            text = "📋 **لا توجد روابط اشتراك بعد.**"
+            keyboard = [
+                [InlineKeyboardButton("➕ إنشاء رابط", callback_data="sub_create")],
+                [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")],
+            ]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            return
+        import time as _t
+        now = int(_t.time())
+        text = f"📋 **روابط الاشتراك ({len(subs)}):**\n\n"
+        for s in subs:
+            exp = s.get("expires_at")
+            state = "🟢 نشط" if s.get("active") else "🔴 موقوف"
+            if exp:
+                try:
+                    from datetime import datetime as _dt
+                    ep = int(_dt.strptime(str(exp), "%Y-%m-%d %H:%M:%S").timestamp())
+                    state += " — ⛔ منتهي" if ep < now else f" — ⏳ حتى `{exp}`"
+                except Exception:
+                    state += f" — ⏳ حتى `{exp}`"
+            else:
+                state += " — ∞ بلا انتهاء"
+            text += (
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"🏷️ **{s.get('label') or '—'}**\n"
+                f"• الحالة: {state}\n"
+                f"• السيرفرات: `{s.get('server_ids') or 'الكل'}`\n"
+                f"🔗 `{public_base()}/sub/{s['token']}`\n"
+            )
+        text += "━━━━━━━━━━━━━━━━━━━"
+        keyboard = [
+            [InlineKeyboardButton("➕ إنشاء رابط", callback_data="sub_create")],
+            [InlineKeyboardButton("🗑️ إلغاء رابط", callback_data="sub_del_0")],
+            [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data.startswith("sub_del_"):
+        page = int(data.split("_")[-1])
+        subs = database.list_subscriptions()
+        if not subs:
+            keyboard = [[InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")]]
+            await query.edit_message_text("لا توجد روابط.", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+        per_page = 5
+        start_idx = page * per_page
+        end_idx = min(start_idx + per_page, len(subs))
+        keyboard = []
+        for s in subs[start_idx:end_idx]:
+            keyboard.append([InlineKeyboardButton(
+                f"🗑️ {s.get('label') or s['token'][:8]}",
+                callback_data=f"sub_confirm_del_{s['token']}")])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"sub_del_{page - 1}"))
+        if end_idx < len(subs):
+            nav.append(InlineKeyboardButton("التالي ➡️", callback_data=f"sub_del_{page + 1}"))
+        if nav:
+            keyboard.append(nav)
+        keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_subs")])
+        await query.edit_message_text("🗑️ **اختر الرابط الذي تريد إلغاءه:**",
+                                      reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data.startswith("sub_confirm_del_"):
+        token = data[len("sub_confirm_del_"):]
+        sub = database.get_subscription(token)
+        label = (sub.get("label") if sub else "") or token[:8]
+        text = f"⚠️ **تأكيد الإلغاء:**\n\nحذف رابط الاشتراك الخاص بـ **{label}** نهائيًا؟"
+        keyboard = [
+            [InlineKeyboardButton("✅ نعم، احذف", callback_data=f"sub_exec_del_{token}")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="sub_del_0")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data.startswith("sub_exec_del_"):
+        token = data[len("sub_exec_del_"):]
+        database.delete_subscription(token)
+        await query.answer("تم حذف الرابط.", show_alert=True)
+        text = "✅ **تم حذف رابط الاشتراك.**"
+        keyboard = [[InlineKeyboardButton("🔙 روابط الاشتراك", callback_data="menu_subs")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data.startswith("sub_sel_"):
+        page = int(data.split("_")[-1])
+        session = SESSIONS.get(user_id)
+        if not session or session.get("mode") != "sub":
+            await query.answer("انتهت الجلسة، ابدأ من جديد.", show_alert=True)
+            return
+        txt, kb = sub_picker_view(session, page)
+        await query.edit_message_text(txt, reply_markup=kb, parse_mode="Markdown")
+
+    elif data.startswith("sub_tog_"):
+        parts = data.split("_")
+        sid = int(parts[2])
+        page = int(parts[3])
+        session = SESSIONS.get(user_id)
+        if not session or session.get("mode") != "sub":
+            await query.answer("انتهت الجلسة، ابدأ من جديد.", show_alert=True)
+            return
+        sel = session["data"].setdefault("selected", [])
+        if sid in sel:
+            sel.remove(sid)
+        else:
+            sel.append(sid)
+        txt, kb = sub_picker_view(session, page)
+        await query.edit_message_text(txt, reply_markup=kb, parse_mode="Markdown")
+
+    elif data.startswith("sub_all_"):
+        page = int(data.split("_")[-1])
+        session = SESSIONS.get(user_id)
+        if not session or session.get("mode") != "sub":
+            await query.answer("انتهت الجلسة، ابدأ من جديد.", show_alert=True)
+            return
+        session["data"]["selected"] = [s["id"] for s in database.get_all_servers()]
+        txt, kb = sub_picker_view(session, page)
+        await query.edit_message_text(txt, reply_markup=kb, parse_mode="Markdown")
+
+    elif data.startswith("sub_none_"):
+        page = int(data.split("_")[-1])
+        session = SESSIONS.get(user_id)
+        if not session or session.get("mode") != "sub":
+            await query.answer("انتهت الجلسة، ابدأ من جديد.", show_alert=True)
+            return
+        session["data"]["selected"] = []
+        txt, kb = sub_picker_view(session, page)
+        await query.edit_message_text(txt, reply_markup=kb, parse_mode="Markdown")
+
+    elif data == "sub_confirm":
+        session = SESSIONS.get(user_id)
+        if not session or session.get("mode") != "sub":
+            await query.answer("انتهت الجلسة، ابدأ من جديد.", show_alert=True)
+            return
+        sel = session["data"].get("selected", [])
+        if not sel:
+            await query.answer("اختر سيرفر واحد على الأقل (أو «تحديد الكل»).", show_alert=True)
+            return
+        server_ids = ",".join(str(x) for x in sel)
+        info = database.create_subscription(
+            label=session["data"].get("label", ""),
+            days=session["data"].get("days", 0),
+            server_ids=server_ids,
+        )
+        SESSIONS.pop(user_id, None)
+        url = f"{public_base()}/sub/{info['token']}"
+        exp = info.get("expires_at")
+        text = (
+            "🎉 **تم إنشاء رابط الاشتراك!**\n\n"
+            f"• المستخدم: **{info.get('label') or '—'}**\n"
+            f"• الانتهاء: `{exp or 'بلا انتهاء'}`\n"
+            f"• عدد السيرفرات: `{len(sel)}`\n\n"
+            f"🔗 **الرابط:**\n`{url}`\n\n"
+            "أرسله للمستخدم: يلصقه في «استيراد اشتراك» وتنضاف له كل السيرفرات المحددة دفعة وحدة."
+        )
+        keyboard = [
+            [InlineKeyboardButton("➕ رابط آخر", callback_data="sub_create")],
+            [InlineKeyboardButton("📋 عرض الروابط", callback_data="sub_list")],
+            [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
     # ---------- Announcement ----------
     elif data == "menu_announce":
         SESSIONS[user_id] = {"mode": "announce", "step": "text", "data": {}}
@@ -436,6 +675,37 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
                 return
 
+        if mode == "sub":
+            step = session.get("step")
+            if step == "label":
+                session["data"]["label"] = text or "مستخدم"
+                session["step"] = "days"
+                await update.message.reply_text(
+                    f"🏷️ الاسم: **{session['data']['label']}**\n\n"
+                    "⏳ **الخطوة 2 من 3:** أرسل **عدد أيام الاشتراك** (مثال: 30)\n"
+                    "أو أرسل `0` أو `-` لرابط **بلا انتهاء**:",
+                    parse_mode="Markdown")
+                return
+            elif step == "days":
+                days = 0
+                if text.strip() not in ("-", "0"):
+                    if not text.strip().isdigit():
+                        await update.message.reply_text(
+                            "⚠️ أرسل رقمًا صحيحًا (أيام) أو `0` لبلا انتهاء.", parse_mode="Markdown")
+                        return
+                    days = int(text.strip())
+                session["data"]["days"] = days
+                session["data"]["selected"] = []
+                session["step"] = "pick"
+                txt, kb = sub_picker_view(session, 0)
+                await update.message.reply_text(txt, reply_markup=kb, parse_mode="Markdown")
+                return
+            elif step == "pick":
+                # المستخدم أرسل نصًا بدل الاختيار — نعيد عرض القائمة
+                txt, kb = sub_picker_view(session, 0)
+                await update.message.reply_text("👇 اختر السيرفرات من الأزرار:", reply_markup=kb, parse_mode="Markdown")
+                return
+
         if mode == "adv":
             step = session.get("step")
             sid = session["data"].get("id")
@@ -529,6 +799,29 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+async def sub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick: /sub <days> <label...>  (days=0 لبلا انتهاء)"""
+    user_id = update.effective_user.id
+    if not is_owner(user_id):
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "الاستخدام: `/sub الأيام الاسم`\nمثال: `/sub 30 أحمد`\n(0 = بلا انتهاء)",
+            parse_mode="Markdown")
+        return
+    if not args[0].isdigit():
+        await update.message.reply_text("⚠️ أول قيمة يجب أن تكون عدد الأيام (رقم).", parse_mode="Markdown")
+        return
+    days = int(args[0])
+    label = " ".join(args[1:])
+    info = database.create_subscription(label=label, days=days)
+    url = f"{public_base()}/sub/{info['token']}"
+    await update.message.reply_text(
+        f"✅ تم إنشاء رابط اشتراك لـ **{label}**\n\n🔗 `{url}`",
+        parse_mode="Markdown")
+
+
 async def announce_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Quick: /announce <text>"""
     user_id = update.effective_user.id
@@ -607,6 +900,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("announce", announce_command))
     app.add_handler(CommandHandler("update", update_command))
+    app.add_handler(CommandHandler("sub", sub_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
 

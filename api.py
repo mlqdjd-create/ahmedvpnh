@@ -8,8 +8,10 @@ import threading
 from typing import Optional
 from pathlib import Path
 from dotenv import load_dotenv
+from datetime import datetime
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 # Load environment variables
@@ -42,6 +44,9 @@ RATE_BAN_MINUTES = int(os.getenv("RATE_BAN_MINUTES", "10") or "10")
 # إن ضُبطت، تُرفض أي بصمة غير موجودة (يقتل النسخ المُعاد تغليفها).
 CERT_ALLOWLIST = [x.strip().lower() for x in os.getenv("CERT_ALLOWLIST", "").split(",") if x.strip()]
 TRUST_PROXY = (os.getenv("TRUST_PROXY", "0").strip().lower() in ("1", "true", "yes"))
+# الرابط العام للباكند — يُستعمل لتوليد روابط الاشتراك. مثال:
+# PUBLIC_BASE_URL=https://oscm4ibf.up.railway.app
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 _RL_LOCK = threading.Lock()
 _RL_HITS = {}   # ip -> [epoch, ...]
@@ -138,6 +143,20 @@ class AppUpdateBody(BaseModel):
     version_code: int = 0
     url: str = ""
     message: str = ""
+
+
+class SubscriptionCreate(BaseModel):
+    label: str = ""
+    days: int = 0          # 0 = بلا انتهاء
+    server_ids: str = ""   # فارغ = كل السيرفرات، أو \"1,3,5\"
+    note: str = ""
+
+
+def _public_base(request: Request) -> str:
+    """يُرجع رابط الأساس العام لتوليد روابط الاشتراك."""
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    return str(request.base_url).rstrip("/")
 
 
 def verify_admin_key(
@@ -245,6 +264,57 @@ def health():
         "servers_count": database.get_servers_count(),
         "users_count": database.get_users_count(),
     }
+
+
+# ============================ SUBSCRIPTION CONTENT (PUBLIC) ============================
+# نقطة عامة يحملها تطبيق v2ray المستخدم: https://<base>/sub/<token>
+# محمية بالتوكن نفسه في المسار (سري، طويل، عشوائي) — بلا توقيع التطبيق
+# حتى تعمل مع أي تطبيق v2ray. تُرجع قائمة روابط السيرفرات بصيغة base64.
+
+@app.get("/sub/{token}")
+def get_subscription_content(token: str, request: Request):
+    _enforce_rate_limit(request)
+    sub = database.get_subscription(token)
+    if not sub or not sub.get("active"):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # فحص تاريخ الانتهاء
+    exp = sub.get("expires_at")
+    expire_epoch = 0
+    if exp:
+        try:
+            expire_epoch = int(datetime.strptime(str(exp), "%Y-%m-%d %H:%M:%S").timestamp())
+        except Exception:
+            expire_epoch = 0
+        if expire_epoch and expire_epoch < int(time.time()):
+            raise HTTPException(status_code=403, detail="Subscription expired")
+
+    # جلب السيرفرات (مع فلترة اختيارية بالسيرفرات المسموحة للاشتراك)
+    servers = database.get_all_servers()
+    allow = set()
+    raw_ids = (sub.get("server_ids") or "").strip()
+    if raw_ids:
+        for x in raw_ids.split(","):
+            x = x.strip()
+            if x.isdigit():
+                allow.add(int(x))
+
+    lines = []
+    for s in servers:
+        if allow and s["id"] not in allow:
+            continue
+        cfg = (s.get("config") or "").strip()
+        if cfg:
+            lines.append(cfg)
+
+    body = "\n".join(lines)
+    encoded = base64.b64encode(body.encode("utf-8")).decode("ascii")
+    headers = {
+        "Profile-Title": sub.get("label") or "Iraq Tunnel",
+        "Subscription-Userinfo": f"upload=0; download=0; total=0; expire={expire_epoch}",
+    }
+    database.touch_subscription(token)
+    return PlainTextResponse(content=encoded, headers=headers)
 
 
 # ============================ SERVERS ============================
@@ -420,6 +490,70 @@ def set_app_update(data: AppUpdateBody):
         "url": data.url,
         "message": data.message,
     }))
+    return {"status": "success"}
+
+
+# ============================ SUBSCRIPTIONS (ADMIN) ============================
+
+@app.post("/api/subscriptions", dependencies=[Depends(verify_admin_key)])
+def create_subscription_endpoint(data: SubscriptionCreate, request: Request):
+    """إنشاء رابط اشتراك مدفوع لمستخدم محدد. days=0 يعني بلا انتهاء."""
+    if data.days and data.days < 0:
+        raise HTTPException(status_code=400, detail="days must be >= 0")
+    info = database.create_subscription(
+        label=data.label, days=data.days, server_ids=data.server_ids, note=data.note)
+    base = _public_base(request)
+    info["url"] = f"{base}/sub/{info['token']}"
+    return {"status": "success", **info}
+
+
+@app.get("/api/subscriptions", dependencies=[Depends(verify_admin_key)])
+def list_subscriptions_endpoint(request: Request):
+    base = _public_base(request)
+    now = int(time.time())
+    out = []
+    for s in database.list_subscriptions():
+        exp = s.get("expires_at")
+        expire_epoch = 0
+        expired = False
+        if exp:
+            try:
+                expire_epoch = int(datetime.strptime(str(exp), "%Y-%m-%d %H:%M:%S").timestamp())
+                expired = expire_epoch < now
+            except Exception:
+                pass
+        out.append({
+            "token": s["token"],
+            "label": s.get("label") or "",
+            "note": s.get("note") or "",
+            "server_ids": s.get("server_ids") or "",
+            "expires_at": exp,
+            "expire_epoch": expire_epoch,
+            "active": bool(s.get("active")),
+            "expired": expired,
+            "created_at": s.get("created_at"),
+            "last_used": s.get("last_used"),
+            "url": f"{base}/sub/{s['token']}",
+        })
+    return {"subscriptions": out}
+
+
+@app.post("/api/subscriptions/{token}/toggle", dependencies=[Depends(verify_admin_key)])
+def toggle_subscription_endpoint(token: str):
+    """تفعيل/إيقاف رابط اشتراك مؤقتًا."""
+    sub = database.get_subscription(token)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    new_state = not bool(sub.get("active"))
+    database.set_subscription_active(token, new_state)
+    return {"status": "success", "active": new_state}
+
+
+@app.delete("/api/subscriptions/{token}", dependencies=[Depends(verify_admin_key)])
+def delete_subscription_endpoint(token: str):
+    ok = database.delete_subscription(token)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Subscription not found")
     return {"status": "success"}
 
 
