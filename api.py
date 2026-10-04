@@ -231,6 +231,12 @@ def root():
     }
 
 
+@app.get("/healthz")
+def healthz():
+    """نقطة فحص مفتوحة لـRailway (بدون مصادقة) — اجعل مسار الفحص في Railway = /healthz."""
+    return {"status": "ok"}
+
+
 @app.get("/api/health", dependencies=[Depends(verify_basic)])
 def health():
     return {
