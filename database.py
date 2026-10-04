@@ -103,6 +103,14 @@ def init_db() -> None:
             last_used TIMESTAMP
         )
         """)
+        # مدراء متعددون للوحة/البوت (المالك دائمًا مدير).
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id TEXT PRIMARY KEY,
+            name TEXT DEFAULT '',
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
         conn.commit()
     finally:
         conn.close()
@@ -394,6 +402,54 @@ def touch_subscription(token: str) -> None:
         cursor = conn.cursor()
         cursor.execute("UPDATE subscriptions SET last_used = CURRENT_TIMESTAMP WHERE token = ?", (token,))
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ============================ ADMINS ============================
+# مدراء متعددون للوحة/البوت. المالك (OWNER_ID) دائمًا مدير ولا يُحذف.
+
+def add_admin(user_id, name: str = "") -> None:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO admins (user_id, name) VALUES (?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET name = excluded.name""",
+            (str(user_id), (name or "").strip()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def remove_admin(user_id) -> bool:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM admins WHERE user_id = ?", (str(user_id),))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def list_admins() -> List[Dict[str, Any]]:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, name, added_at FROM admins ORDER BY added_at ASC")
+        return [dict(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def is_admin(user_id) -> bool:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM admins WHERE user_id = ?", (str(user_id),))
+        return cursor.fetchone() is not None
     finally:
         conn.close()
 

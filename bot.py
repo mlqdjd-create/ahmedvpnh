@@ -58,6 +58,16 @@ def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
 
+def is_admin(user_id: int) -> bool:
+    """المالك دائمًا مدير، بالإضافة للمدراء المضافين في قاعدة البيانات."""
+    if user_id == OWNER_ID:
+        return True
+    try:
+        return database.is_admin(user_id)
+    except Exception:
+        return False
+
+
 def get_main_menu_keyboard():
     keyboard = [
         [
@@ -77,6 +87,9 @@ def get_main_menu_keyboard():
         ],
         [
             InlineKeyboardButton("🔗 روابط الاشتراك المدفوعة", callback_data="menu_subs")
+        ],
+        [
+            InlineKeyboardButton("👥 المدراء", callback_data="menu_admins")
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -119,10 +132,11 @@ def main_menu_text() -> str:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if not is_owner(user_id):
+    if not is_admin(user_id):
         await update.message.reply_text(
-            "⛔ **عذراً، هذا البوت خاص بمالك تطبيق AHMED VPN فقط.**\n"
-            f"آيدي المستخدم الخاص بك: `{user_id}` غير مصرح له.",
+            "⛔ **عذرًا، هذا البوت خاص بالمدراء فقط.**\n"
+            f"آيدي المستخدم الخاص بك: `{user_id}` غير مصرح له.\n\n"
+            "💡 أرسل هذا الآيدي للمالك ليضيفك كمدير.",
             parse_mode="Markdown"
         )
         return
@@ -181,8 +195,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = update.effective_user.id
 
-    if not is_owner(user_id):
-        await query.edit_message_text("⛔ عذراً، لست مالك البوت.")
+    if not is_admin(user_id):
+        await query.edit_message_text("⛔ عذرًا، لست من المدراء.")
         return
 
     if data == "menu_refresh" or data == "menu_main":
@@ -553,6 +567,90 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+    # ---------- Admins (owner only) ----------
+    elif data == "menu_admins":
+        if not is_owner(user_id):
+            await query.answer("هذا الخيار للمالك فقط.", show_alert=True)
+            return
+        admins = database.list_admins()
+        text = f"👥 **إدارة المدراء** ({len(admins)})\n\nالمالك: `{OWNER_ID}`\n\n"
+        if admins:
+            for a in admins:
+                text += f"• **{a.get('name') or '—'}** — `{a['user_id']}`\n"
+        else:
+            text += "_لا يوجد مدراء مضافون بعد._\n"
+        keyboard = [
+            [InlineKeyboardButton("➕ إضافة مدير", callback_data="admin_add")],
+            [InlineKeyboardButton("🗑️ إزالة مدير", callback_data="admin_del_0")],
+            [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "admin_add":
+        if not is_owner(user_id):
+            await query.answer("هذا الخيار للمالك فقط.", show_alert=True)
+            return
+        SESSIONS[user_id] = {"mode": "admin", "step": "add_id", "data": {}}
+        text = (
+            "➕ **إضافة مدير**\n\n"
+            "أرسل **آيدي التليجرام** (رقم) للمستخدم الذي تريد إضافته كمدير،\n"
+            "أو **اعمل فوروارد** لرسالة منه هنا.\n\n"
+            "💡 المستخدم يشوف آيديه لما يرسل /start للبوت."
+        )
+        keyboard = [[InlineKeyboardButton("🔙 إلغاء", callback_data="menu_admins")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data.startswith("admin_del_"):
+        if not is_owner(user_id):
+            await query.answer("هذا الخيار للمالك فقط.", show_alert=True)
+            return
+        page = int(data.split("_")[-1])
+        admins = database.list_admins()
+        if not admins:
+            await query.answer("لا يوجد مدراء.", show_alert=True)
+            return
+        per_page = 5
+        start_idx = page * per_page
+        end_idx = min(start_idx + per_page, len(admins))
+        keyboard = []
+        for a in admins[start_idx:end_idx]:
+            keyboard.append([InlineKeyboardButton(
+                f"🗑️ {a.get('name') or a['user_id']}",
+                callback_data=f"admin_confirm_del_{a['user_id']}")])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"admin_del_{page - 1}"))
+        if end_idx < len(admins):
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"admin_del_{page + 1}"))
+        if nav:
+            keyboard.append(nav)
+        keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_admins")])
+        await query.edit_message_text("🗑️ **اختر المدير لإزالته:**",
+                                      reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data.startswith("admin_confirm_del_"):
+        if not is_owner(user_id):
+            await query.answer("هذا الخيار للمالك فقط.", show_alert=True)
+            return
+        aid = data[len("admin_confirm_del_"):]
+        text = f"⚠️ **تأكيد الإزالة:**\n\nإزالة المدير `{aid}`؟"
+        keyboard = [
+            [InlineKeyboardButton("✅ نعم، أزل", callback_data=f"admin_exec_del_{aid}")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="admin_del_0")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data.startswith("admin_exec_del_"):
+        if not is_owner(user_id):
+            await query.answer("هذا الخيار للمالك فقط.", show_alert=True)
+            return
+        aid = data[len("admin_exec_del_"):]
+        database.remove_admin(aid)
+        await query.answer("تمت الإزالة.", show_alert=True)
+        keyboard = [[InlineKeyboardButton("🔙 المدراء", callback_data="menu_admins")]]
+        await query.edit_message_text("✅ **تم إزالة المدير.**",
+                                      reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
     # ---------- Announcement ----------
     elif data == "menu_announce":
         SESSIONS[user_id] = {"mode": "announce", "step": "text", "data": {}}
@@ -576,7 +674,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_owner(user_id):
+    if not is_admin(user_id):
         return
 
     text = (update.message.text or "").strip()
@@ -706,6 +804,40 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 await update.message.reply_text("👇 اختر السيرفرات من الأزرار:", reply_markup=kb, parse_mode="Markdown")
                 return
 
+        if mode == "admin":
+            step = session.get("step")
+            if step == "add_id":
+                if not is_owner(user_id):
+                    SESSIONS.pop(user_id, None)
+                    return
+                target_id = ""
+                fwd = getattr(update.message, "forward_from", None)
+                fwd_chat = getattr(update.message, "forward_from_chat", None)
+                if fwd is not None and getattr(fwd, "id", None):
+                    target_id = str(fwd.id)
+                elif fwd_chat is not None and getattr(fwd_chat, "id", None):
+                    target_id = str(fwd_chat.id)
+                elif text.strip().lstrip("-").isdigit():
+                    target_id = text.strip()
+                if not target_id:
+                    await update.message.reply_text(
+                        "⚠️ أرسل آيدي رقمي أو اعمل فوروارد لرسالة من المستخدم.",
+                        parse_mode="Markdown")
+                    return
+                name = ""
+                if fwd is not None:
+                    parts = [getattr(fwd, "first_name", "") or "", getattr(fwd, "last_name", "") or ""]
+                    name = " ".join(p for p in parts if p).strip()
+                database.add_admin(target_id, name)
+                SESSIONS.pop(user_id, None)
+                reply = f"✅ **تم إضافة المدير:**\n`{target_id}`" + (f"\n({name})" if name else "")
+                keyboard = [
+                    [InlineKeyboardButton("👥 المدراء", callback_data="menu_admins")],
+                    [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")],
+                ]
+                await update.message.reply_text(reply, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+                return
+
         if mode == "adv":
             step = session.get("step")
             sid = session["data"].get("id")
@@ -802,7 +934,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def sub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Quick: /sub <days> <label...>  (days=0 لبلا انتهاء)"""
     user_id = update.effective_user.id
-    if not is_owner(user_id):
+    if not is_admin(user_id):
         return
     args = context.args or []
     if len(args) < 2:
@@ -825,7 +957,7 @@ async def sub_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def announce_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Quick: /announce <text>"""
     user_id = update.effective_user.id
-    if not is_owner(user_id):
+    if not is_admin(user_id):
         return
     text = " ".join(context.args).strip()
     if not text:
@@ -839,7 +971,7 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Quick: /update <versionCode> <apk_url> [message]"""
     import json
     user_id = update.effective_user.id
-    if not is_owner(user_id):
+    if not is_admin(user_id):
         return
     args = context.args or []
     if len(args) < 2:
