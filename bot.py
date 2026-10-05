@@ -241,6 +241,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("VMESS", callback_data="set_proto_VMESS"),
                 InlineKeyboardButton("TROJAN", callback_data="set_proto_TROJAN")
             ],
+            [
+                InlineKeyboardButton("SSH", callback_data="set_proto_SSH"),
+                InlineKeyboardButton("Shadowsocks", callback_data="set_proto_SHADOWSOCKS"),
+                InlineKeyboardButton("WireGuard", callback_data="set_proto_WIREGUARD")
+            ],
             [InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")]
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -251,11 +256,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if session:
             session["data"]["protocol"] = proto
             session["step"] = "config"
-            text = (
-                f"✅ تم اختيار البروتوكول: `{proto}`\n\n"
-                "🔗 **الخطوة 3 من 3:**\n"
-                f"أرسل الآن **رابط السيرفر** (يبدأ بـ `{proto.lower()}://`):"
-            )
+            if proto == "WIREGUARD":
+                hint = ("أرسل الآن **إعداد WireGuard** (لازم يبدأ بـ `[Interface]`):\n\n"
+                        "`[Interface]` ثم `PrivateKey` و`Address`، ثم `[Peer]` ثم `PublicKey` "
+                        "و`Endpoint` و`AllowedIPs`.\n\n"
+                        "أو رابط `wg://<base64>`.")
+            elif proto == "SSH":
+                hint = "أرسل الآن **رابط SSH** (يبدأ بـ `ssh://`)."
+            elif proto == "SHADOWSOCKS":
+                hint = "أرسل الآن **رابط Shadowsocks** (يبدأ بـ `ss://`)."
+            else:
+                hint = f"أرسل الآن **رابط السيرفر** (يبدأ بـ `{proto.lower()}://`)."
+            text = f"✅ تم اختيار البروتوكول: `{proto}`\n\n🔗 **الخطوة 3 من 3:**\n{hint}"
             keyboard = [[InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")]]
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
@@ -711,8 +723,24 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     text = (update.message.text or "").strip()
     session = SESSIONS.get(user_id)
 
-    # 1. Quick direct-link detection (vless://, vmess://, trojan://)
-    if text.startswith("vless://") or text.startswith("vmess://") or text.startswith("trojan://"):
+    # 1. Quick direct-link detection (vless/vmess/trojan/ssh/ss) + WireGuard config
+    _low = text.strip().lower()
+    _is_wg = _low.startswith("[interface]") or _low.startswith("wg://") or _low.startswith("wireguard://")
+    _is_link = _low.startswith(("vless://", "vmess://", "trojan://", "ssh://", "ss://"))
+    if _is_wg or _is_link:
+        if _is_wg:
+            # إعداد WireGuard كامل (multi-line) → سيرفر واحد
+            database.add_server(name="WireGuard Server", protocol="WIREGUARD", config=text.strip())
+            SESSIONS.pop(user_id, None)
+            keyboard = [
+                [InlineKeyboardButton("📋 عرض السيرفرات", callback_data="menu_list_servers")],
+                [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")]
+            ]
+            await update.message.reply_text(
+                "✅ **تمت إضافة سيرفر WireGuard بنجاح!** 🚀\n\n"
+                "• **الاسم:** WireGuard Server\n• **البروتوكول:** `WIREGUARD`",
+                reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            return
         lines = text.splitlines()
         added = 0
         name = ""
@@ -721,7 +749,19 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             line = line.strip()
             if not line:
                 continue
-            proto = "VLESS" if line.startswith("vless://") else ("VMESS" if line.startswith("vmess://") else "TROJAN")
+            ll = line.lower()
+            if ll.startswith("vless://"):
+                proto = "VLESS"
+            elif ll.startswith("vmess://"):
+                proto = "VMESS"
+            elif ll.startswith("trojan://"):
+                proto = "TROJAN"
+            elif ll.startswith("ssh://"):
+                proto = "SSH"
+            elif ll.startswith("ss://"):
+                proto = "SHADOWSOCKS"
+            else:
+                continue
             name = f"Server {database.get_servers_count() + 1}"
             if "#" in line:
                 from urllib.parse import unquote
