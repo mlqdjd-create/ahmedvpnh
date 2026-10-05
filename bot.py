@@ -117,12 +117,14 @@ def get_flag_for_name(name: str) -> str:
 
 
 def main_menu_text() -> str:
-    count = database.get_servers_count()
+    count = database.get_servers_count(category="main")
+    subcount = database.get_servers_count(category="sub")
     users = database.get_users_count()
     return (
         "🚀 **AHMED VPN — لوحة التحكم بالخوادم** 🛡️\n\n"
-        "مرحباً بك يا مالك التطبيق في لوحة الإدارة.\n\n"
-        f"📊 عدد السيرفرات الحالية: `{count}`\n"
+        "مرحباً بك في لوحة الإدارة.\n\n"
+        f"📱 سيرفرات التطبيق: `{count}`\n"
+        f"🔗 سيرفرات الاشتراك: `{subcount}`\n"
         f"👥 عدد الأجهزة المسجّلة: `{users}`\n"
         f"🌐 رابط الـ API للتطبيق:\n`http://{HOST}:{PORT}/api/servers`\n\n"
         "اختر أحد الخيارات للبدء:"
@@ -151,9 +153,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def sub_picker_view(session, page=0):
     """يبني (النص، الكيبورد) لاختيار السيرفرات بالضغط داخل رابط الاشتراك."""
-    servers = database.get_all_servers()
+    servers = database.get_all_servers(category="sub")
     if not servers:
-        text = "⚠️ **لا توجد سيرفرات بعد.** أضف سيرفرات أولًا ثم أنشئ رابط اشتراك."
+        text = ("⚠️ **لا توجد سيرفرات اشتراك بعد.**\n\n"
+                "أضف سيرفرات من نوع **🔗 اشتراك** أولًا (زر «➕ إضافة سيرفر» → اختر «🔗 اشتراك»)،\n"
+                "وبعدها سوِّ رابط الاشتراك.")
         keyboard = [[InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu_main")]]
         return text, InlineKeyboardMarkup(keyboard)
     selected = set(session["data"].get("selected", []))
@@ -213,9 +217,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "➕ **إضافة سيرفر جديد (الخطوة 1 من 3):**\n\n"
             "أرسل الآن **اسم السيرفر**:\n"
             "*(مثال: Germany 01)*\n\n"
-            "💡 أو يمكنك إرسال رابط السيرفر مباشرة (`vless://...`, `vmess://...`, `trojan://...`) ليتم تحليله وحفظه فورياً."
+            "💡 أو أرسل رابط السيرفر مباشرة (`vless://...`) ليُحفظ فورًا كسيرفر **رئيسي** للتطبيق."
         )
         keyboard = [[InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data == "set_cat_main" or data == "set_cat_sub":
+        session = SESSIONS.get(user_id)
+        if not session or session.get("mode") != "add":
+            await query.answer("انتهت الجلسة، ابدأ من جديد.", show_alert=True)
+            return
+        cat = "main" if data == "set_cat_main" else "sub"
+        session["data"]["category"] = cat
+        session["step"] = "protocol"
+        label = "📱 رئيسي (للتطبيق)" if cat == "main" else "🔗 اشتراك (معزول)"
+        text = (
+            f"✅ النوع: **{label}**\n\n"
+            "⚡ **الخطوة 2 من 3:** اختر **البروتوكول** من الأزرار أدناه:"
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton("VLESS", callback_data="set_proto_VLESS"),
+                InlineKeyboardButton("VMESS", callback_data="set_proto_VMESS"),
+                InlineKeyboardButton("TROJAN", callback_data="set_proto_TROJAN")
+            ],
+            [InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")]
+        ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
     elif data.startswith("set_proto_"):
@@ -246,11 +273,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"📋 **عرض السيرفرات المتاحة ({len(servers)} سيرفر):**\n\n"
         for s in servers:
             flag = get_flag_for_name(s["name"])
+            cat_tag = "📱 رئيسي" if (s.get("category") or "main") == "main" else "🔗 اشتراك"
             text += (
                 f"━━━━━━━━━━━━━━━━━━━\n"
                 f"🔹 **ID:** `{s['id']}`\n"
                 f"🏷️ **الاسم:** {flag} {s['name']}\n"
                 f"⚡ **البروتوكول:** `{s['protocol']}`\n"
+                f"🧩 **النوع:** {cat_tag}\n"
                 f"📅 **تاريخ الإضافة:** `{s['created_at']}`\n"
                 f"🔗 **الرابط:**\n`{s['config']}`\n"
             )
@@ -279,9 +308,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = []
         for s in current_page:
             flag = get_flag_for_name(s["name"])
+            cat_tag = "📱" if (s.get("category") or "main") == "main" else "🔗"
             keyboard.append([
                 InlineKeyboardButton(
-                    f"🗑️ {flag} {s['name']} ({s['protocol']})",
+                    f"🗑️ {cat_tag} {flag} {s['name']} ({s['protocol']})",
                     callback_data=f"confirm_del_{s['id']}"
                 )
             ])
@@ -356,7 +386,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if s.get("payload"):
                 has.append("بايلود")
             tag = (" — " + " + ".join(has)) if has else ""
-            keyboard.append([InlineKeyboardButton(f"🧩 {flag} {s['name']}{tag}", callback_data=f"adv_pick_{s['id']}")])
+            cat_tag = "📱" if (s.get("category") or "main") == "main" else "🔗"
+            keyboard.append([InlineKeyboardButton(f"🧩 {cat_tag} {flag} {s['name']}{tag}", callback_data=f"adv_pick_{s['id']}")])
         nav = []
         if page > 0:
             nav.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"menu_advanced_{page - 1}"))
@@ -520,7 +551,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not session or session.get("mode") != "sub":
             await query.answer("انتهت الجلسة، ابدأ من جديد.", show_alert=True)
             return
-        session["data"]["selected"] = [s["id"] for s in database.get_all_servers()]
+        session["data"]["selected"] = [s["id"] for s in database.get_all_servers(category="sub")]
         txt, kb = sub_picker_view(session, page)
         await query.edit_message_text(txt, reply_markup=kb, parse_mode="Markdown")
 
@@ -884,18 +915,16 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             step = session.get("step")
             if step == "name":
                 session["data"]["name"] = text
-                session["step"] = "protocol"
+                session["step"] = "category"
                 prompt = (
                     f"🏷️ اسم السيرفر: **{text}**\n\n"
-                    "⚡ **الخطوة 2 من 3:**\n"
-                    "اختر **البروتوكول** من الأزرار أدناه:"
+                    "🧩 **أين يروح هذا السيرفر؟**\n"
+                    "• 📱 **رئيسي** = يظهر لكل مستخدمي التطبيق (القائمة العامة)\n"
+                    "• 🔗 **اشتراك** = فقط داخل روابط الاشتراك (معزول تمامًا)"
                 )
                 keyboard = [
-                    [
-                        InlineKeyboardButton("VLESS", callback_data="set_proto_VLESS"),
-                        InlineKeyboardButton("VMESS", callback_data="set_proto_VMESS"),
-                        InlineKeyboardButton("TROJAN", callback_data="set_proto_TROJAN")
-                    ],
+                    [InlineKeyboardButton("📱 رئيسي (للتطبيق)", callback_data="set_cat_main")],
+                    [InlineKeyboardButton("🔗 اشتراك (للروابط)", callback_data="set_cat_sub")],
                     [InlineKeyboardButton("🔙 إلغاء", callback_data="menu_main")]
                 ]
                 await update.message.reply_text(prompt, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -904,17 +933,20 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             elif step == "config":
                 proto = session["data"].get("protocol", "VLESS")
                 name = session["data"].get("name", "Server")
+                category = session["data"].get("category", "main")
                 config = text
 
-                sid = database.add_server(name=name, protocol=proto, config=config)
+                sid = database.add_server(name=name, protocol=proto, config=config, category=category)
                 SESSIONS.pop(user_id, None)
 
                 flag = get_flag_for_name(name)
+                type_label = "📱 رئيسي (للتطبيق)" if category == "main" else "🔗 اشتراك (معزول)"
                 reply = (
                     "🎉 **تم حفظ السيرفر بنجاح في قاعدة البيانات!**\n\n"
                     f"• **ID:** `{sid}`\n"
                     f"• **الاسم:** {flag} {name}\n"
                     f"• **البروتوكول:** `{proto}`\n"
+                    f"• **النوع:** {type_label}\n"
                     f"• **الرابط:** `{config[:35]}...`\n"
                 )
                 keyboard = [

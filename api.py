@@ -261,7 +261,8 @@ def health():
     return {
         "status": "healthy",
         "app": "AHMED VPN",
-        "servers_count": database.get_servers_count(),
+        "servers_count": database.get_servers_count(category="main"),
+        "sub_servers_count": database.get_servers_count(category="sub"),
         "users_count": database.get_users_count(),
     }
 
@@ -289,8 +290,8 @@ def get_subscription_content(token: str, request: Request):
         if expire_epoch and expire_epoch < int(time.time()):
             raise HTTPException(status_code=403, detail="Subscription expired")
 
-    # جلب السيرفرات (مع فلترة اختيارية بالسيرفرات المسموحة للاشتراك)
-    servers = database.get_all_servers()
+    # جلب سيرفرات الاشتراك فقط (معزولة عن سيرفرات التطبيق)
+    servers = database.get_all_servers(category="sub")
     allow = set()
     raw_ids = (sub.get("server_ids") or "").strip()
     if raw_ids:
@@ -324,7 +325,7 @@ def get_servers():
     """Servers list in the exact format expected by the Android app.
     Includes the per-server proxy/payload/country fields (the app applies them
     only for servers that have them, and connects directly otherwise)."""
-    servers = database.get_all_servers()
+    servers = database.get_all_servers(category="main")
     result = []
     for s in servers:
         item = {
@@ -439,7 +440,7 @@ def stats():
     return {
         "per_server": database.get_per_server_counts(),
         "users_count": database.get_users_count(),
-        "servers_count": database.get_servers_count(),
+        "servers_count": database.get_servers_count(category="main"),
     }
 
 

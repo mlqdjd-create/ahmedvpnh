@@ -1,35 +1,70 @@
+import os
 import secrets
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+# ============================================================================
+# طبقة قاعدة البيانات — تدعم PostgreSQL (Supabase) + SQLite كاحتياط.
+# إذا وُجد DATABASE_URL يبدأ بـ postgres، نستعمل PostgreSQL (بيانات دائمة
+# تبقى حتى لو الاستضافة طفت). وإلا نرجع لملف SQLite محلي (للتطوير فقط).
+# ============================================================================
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+IS_POSTGRES = DATABASE_URL.lower().startswith(("postgres://", "postgresql://"))
+if IS_POSTGRES and "sslmode=" not in DATABASE_URL:
+    DATABASE_URL += ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
+
 DB_FILE = Path(__file__).resolve().parent / "ahmed_vpn.db"
 
+if IS_POSTGRES:
+    import psycopg2
+    import psycopg2.extras
 
-def get_connection() -> sqlite3.Connection:
+_AUTOINC = "SERIAL PRIMARY KEY" if IS_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def get_connection():
+    if IS_POSTGRES:
+        return psycopg2.connect(DATABASE_URL, connect_timeout=20)
     conn = sqlite3.connect(str(DB_FILE))
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def _cur(conn):
+    if IS_POSTGRES:
+        return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    return conn.cursor()
+
+
+def _s(sql: str) -> str:
+    """يحوّل علامات الاستفهام ? إلى %s لـPostgreSQL."""
+    return sql.replace("?", "%s") if IS_POSTGRES else sql
+
+
+_SERVER_COLUMNS = ("id, name, protocol, config, created_at, country, "
+                   "proxy_host, proxy_port, proxy_user, proxy_pass, payload, category")
+
+
 def init_db() -> None:
-    """Create every table the app + bot need. Uses try/finally so the
-    connection is always closed (the sqlite3 context manager only commits)."""
+    """Create every table the app + bot need (works on both engines)."""
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("""
+        cur = _cur(conn)
+        cur.execute(f"""
         CREATE TABLE IF NOT EXISTS servers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_AUTOINC},
             name TEXT NOT NULL,
             protocol TEXT NOT NULL,
             config TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
-        # Per-server advanced fields (proxy / payload / country). Added later,
-        # so migrate existing databases with ALTER TABLE.
+        conn.commit()
+        # Per-server extra fields (proxy / payload / country / category).
+        # category: 'main' = يظهر لكل مستخدمي التطبيق، 'sub' = سيرفرات الاشتراك فقط (معزولة).
         server_cols = {
             "country": "TEXT DEFAULT ''",
             "proxy_host": "TEXT DEFAULT ''",
@@ -37,17 +72,26 @@ def init_db() -> None:
             "proxy_user": "TEXT DEFAULT ''",
             "proxy_pass": "TEXT DEFAULT ''",
             "payload": "TEXT DEFAULT ''",
+            "category": "TEXT DEFAULT 'main'",
         }
-        existing = {row["name"] for row in cursor.execute("PRAGMA table_info(servers)").fetchall()}
+        if IS_POSTGRES:
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'servers'")
+            existing = {r["column_name"] for r in cur.fetchall()}
+        else:
+            cur.execute("PRAGMA table_info(servers)")
+            existing = {r["name"] for r in cur.fetchall()}
         for col, decl in server_cols.items():
             if col not in existing:
                 try:
-                    cursor.execute(f"ALTER TABLE servers ADD COLUMN {col} {decl}")
-                except sqlite3.OperationalError:
-                    pass
+                    cur.execute(f"ALTER TABLE servers ADD COLUMN {col} {decl}")
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
 
-        # Installations / devices that pinged the backend
-        cursor.execute("""
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY,
             app_version TEXT,
@@ -55,44 +99,38 @@ def init_db() -> None:
             last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
-        # Currently connected user -> server (used for per-server user counts)
-        cursor.execute("""
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS active_sessions (
             user_id TEXT PRIMARY KEY,
             server TEXT NOT NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
-        # Raw activity log (connect/disconnect/...)
-        cursor.execute("""
+        cur.execute(f"""
         CREATE TABLE IF NOT EXISTS activity (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_AUTOINC},
             user_id TEXT,
             server TEXT,
             event TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
-        # Broadcast announcements (the app polls the latest one)
-        cursor.execute("""
+        cur.execute(f"""
         CREATE TABLE IF NOT EXISTS announcements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_AUTOINC},
             message TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
-        # Key/value settings (used for the forced app update)
-        cursor.execute("""
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
         """)
-        # روابط الاشتراك المدفوعة: كل توكن = مستخدم واحد، له تاريخ انتهاء
-        # ويمكن ربطه بسيرفرات محددة (server_ids فارغ = كل السيرفرات).
-        cursor.execute("""
+        cur.execute(f"""
         CREATE TABLE IF NOT EXISTS subscriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {_AUTOINC},
             token TEXT UNIQUE NOT NULL,
             label TEXT DEFAULT '',
             note TEXT DEFAULT '',
@@ -103,8 +141,7 @@ def init_db() -> None:
             last_used TIMESTAMP
         )
         """)
-        # مدراء متعددون للوحة/البوت (المالك دائمًا مدير).
-        cursor.execute("""
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS admins (
             user_id TEXT PRIMARY KEY,
             name TEXT DEFAULT '',
@@ -120,20 +157,26 @@ def init_db() -> None:
 
 def add_server(name: str, protocol: str, config: str,
                country: str = "", proxy_host: str = "", proxy_port: int = 0,
-               proxy_user: str = "", proxy_pass: str = "", payload: str = "") -> int:
+               proxy_user: str = "", proxy_pass: str = "", payload: str = "",
+               category: str = "main") -> int:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """INSERT INTO servers
-               (name, protocol, config, country, proxy_host, proxy_port, proxy_user, proxy_pass, payload)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (name.strip(), protocol.strip().upper(), config.strip(),
-             (country or "").strip(), (proxy_host or "").strip(), int(proxy_port or 0),
-             (proxy_user or "").strip(), proxy_pass or "", payload or ""),
-        )
+        cur = _cur(conn)
+        sql = """INSERT INTO servers
+               (name, protocol, config, country, proxy_host, proxy_port, proxy_user, proxy_pass, payload, category)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+        params = (name.strip(), protocol.strip().upper(), config.strip(),
+                  (country or "").strip(), (proxy_host or "").strip(), int(proxy_port or 0),
+                  (proxy_user or "").strip(), proxy_pass or "", payload or "",
+                  (category or "main").strip())
+        if IS_POSTGRES:
+            cur.execute(_s(sql) + " RETURNING id", params)
+            row = cur.fetchone()
+            conn.commit()
+            return row["id"]
+        cur.execute(sql, params)
         conn.commit()
-        return cursor.lastrowid
+        return cur.lastrowid
     finally:
         conn.close()
 
@@ -143,30 +186,29 @@ def update_server_advanced(server_id: int, country: str = "", proxy_host: str = 
                            proxy_pass: str = "", payload: str = "") -> bool:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """UPDATE servers
+        cur = _cur(conn)
+        cur.execute(_s("""
+            UPDATE servers
                SET country = ?, proxy_host = ?, proxy_port = ?, proxy_user = ?, proxy_pass = ?, payload = ?
-               WHERE id = ?""",
-            ((country or "").strip(), (proxy_host or "").strip(), int(proxy_port or 0),
-             (proxy_user or "").strip(), proxy_pass or "", payload or "", server_id),
-        )
+             WHERE id = ?
+        """), ((country or "").strip(), (proxy_host or "").strip(), int(proxy_port or 0),
+               (proxy_user or "").strip(), proxy_pass or "", payload or "", server_id))
         conn.commit()
-        return cursor.rowcount > 0
+        return cur.rowcount > 0
     finally:
         conn.close()
 
 
-_SERVER_COLUMNS = ("id, name, protocol, config, created_at, country, "
-                   "proxy_host, proxy_port, proxy_user, proxy_pass, payload")
-
-
-def get_all_servers() -> List[Dict[str, Any]]:
+def get_all_servers(category: Optional[str] = None) -> List[Dict[str, Any]]:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(f"SELECT {_SERVER_COLUMNS} FROM servers ORDER BY id DESC")
-        return [dict(row) for row in cursor.fetchall()]
+        cur = _cur(conn)
+        if category:
+            cur.execute(_s(f"SELECT {_SERVER_COLUMNS} FROM servers WHERE category = ? ORDER BY id DESC"),
+                        (category,))
+        else:
+            cur.execute(f"SELECT {_SERVER_COLUMNS} FROM servers ORDER BY id DESC")
+        return [dict(row) for row in cur.fetchall()]
     finally:
         conn.close()
 
@@ -174,9 +216,9 @@ def get_all_servers() -> List[Dict[str, Any]]:
 def get_server_by_id(server_id: int) -> Optional[Dict[str, Any]]:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(f"SELECT {_SERVER_COLUMNS} FROM servers WHERE id = ?", (server_id,))
-        row = cursor.fetchone()
+        cur = _cur(conn)
+        cur.execute(_s(f"SELECT {_SERVER_COLUMNS} FROM servers WHERE id = ?"), (server_id,))
+        row = cur.fetchone()
         return dict(row) if row else None
     finally:
         conn.close()
@@ -185,20 +227,23 @@ def get_server_by_id(server_id: int) -> Optional[Dict[str, Any]]:
 def delete_server(server_id: int) -> bool:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM servers WHERE id = ?", (server_id,))
+        cur = _cur(conn)
+        cur.execute(_s("DELETE FROM servers WHERE id = ?"), (server_id,))
         conn.commit()
-        return cursor.rowcount > 0
+        return cur.rowcount > 0
     finally:
         conn.close()
 
 
-def get_servers_count() -> int:
+def get_servers_count(category: Optional[str] = None) -> int:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) AS count FROM servers")
-        row = cursor.fetchone()
+        cur = _cur(conn)
+        if category:
+            cur.execute(_s("SELECT COUNT(*) AS count FROM servers WHERE category = ?"), (category,))
+        else:
+            cur.execute("SELECT COUNT(*) AS count FROM servers")
+        row = cur.fetchone()
         return row["count"] if row else 0
     finally:
         conn.close()
@@ -209,14 +254,14 @@ def get_servers_count() -> int:
 def upsert_user(user_id: str, app_version: str = "") -> None:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("""
+        cur = _cur(conn)
+        cur.execute(_s("""
         INSERT INTO users (user_id, app_version, last_seen)
         VALUES (?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(user_id) DO UPDATE SET
             app_version = excluded.app_version,
             last_seen = CURRENT_TIMESTAMP
-        """, (str(user_id), app_version or ""))
+        """), (str(user_id), app_version or ""))
         conn.commit()
     finally:
         conn.close()
@@ -225,34 +270,30 @@ def upsert_user(user_id: str, app_version: str = "") -> None:
 def get_users_count() -> int:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) AS count FROM users")
-        row = cursor.fetchone()
+        cur = _cur(conn)
+        cur.execute("SELECT COUNT(*) AS count FROM users")
+        row = cur.fetchone()
         return row["count"] if row else 0
     finally:
         conn.close()
 
 
 def log_activity(user_id: str, server: str, event: str) -> None:
-    """Record activity and keep the active_sessions table in sync so that
-    per-server live user counts stay accurate."""
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO activity (user_id, server, event) VALUES (?, ?, ?)",
-            (str(user_id), server or "", event or ""),
-        )
+        cur = _cur(conn)
+        cur.execute(_s("INSERT INTO activity (user_id, server, event) VALUES (?, ?, ?)"),
+                    (str(user_id), server or "", event or ""))
         if event == "connect":
-            cursor.execute("""
+            cur.execute(_s("""
             INSERT INTO active_sessions (user_id, server, updated_at)
             VALUES (?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(user_id) DO UPDATE SET
                 server = excluded.server,
                 updated_at = CURRENT_TIMESTAMP
-            """, (str(user_id), server or ""))
+            """), (str(user_id), server or ""))
         elif event == "disconnect":
-            cursor.execute("DELETE FROM active_sessions WHERE user_id = ?", (str(user_id),))
+            cur.execute(_s("DELETE FROM active_sessions WHERE user_id = ?"), (str(user_id),))
         conn.commit()
     finally:
         conn.close()
@@ -261,14 +302,14 @@ def log_activity(user_id: str, server: str, event: str) -> None:
 def get_per_server_counts() -> List[Dict[str, Any]]:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("""
+        cur = _cur(conn)
+        cur.execute("""
         SELECT server, COUNT(*) AS users
         FROM active_sessions
         GROUP BY server
         ORDER BY users DESC
         """)
-        return [{"server": row["server"], "users": row["users"]} for row in cursor.fetchall()]
+        return [{"server": row["server"], "users": row["users"]} for row in cur.fetchall()]
     finally:
         conn.close()
 
@@ -278,10 +319,16 @@ def get_per_server_counts() -> List[Dict[str, Any]]:
 def add_announcement(message: str) -> int:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO announcements (message) VALUES (?)", (message.strip(),))
+        cur = _cur(conn)
+        sql = "INSERT INTO announcements (message) VALUES (?)"
+        if IS_POSTGRES:
+            cur.execute(_s(sql) + " RETURNING id", (message.strip(),))
+            row = cur.fetchone()
+            conn.commit()
+            return row["id"]
+        cur.execute(sql, (message.strip(),))
         conn.commit()
-        return cursor.lastrowid
+        return cur.lastrowid
     finally:
         conn.close()
 
@@ -289,9 +336,9 @@ def add_announcement(message: str) -> int:
 def get_latest_announcement() -> Optional[Dict[str, Any]]:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, message, created_at FROM announcements ORDER BY id DESC LIMIT 1")
-        row = cursor.fetchone()
+        cur = _cur(conn)
+        cur.execute("SELECT id, message, created_at FROM announcements ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
         return dict(row) if row else None
     finally:
         conn.close()
@@ -302,11 +349,11 @@ def get_latest_announcement() -> Optional[Dict[str, Any]]:
 def set_setting(key: str, value: str) -> None:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("""
+        cur = _cur(conn)
+        cur.execute(_s("""
         INSERT INTO settings (key, value) VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """, (key, value))
+        """), (key, value))
         conn.commit()
     finally:
         conn.close()
@@ -315,36 +362,32 @@ def set_setting(key: str, value: str) -> None:
 def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = cursor.fetchone()
+        cur = _cur(conn)
+        cur.execute(_s("SELECT value FROM settings WHERE key = ?"), (key,))
+        row = cur.fetchone()
         return row["value"] if row else default
     finally:
         conn.close()
 
 
 # ============================ SUBSCRIPTIONS ============================
-# روابط الاشتراك المدفوعة: كل توكن يمثّل مستخدمًا واحدًا، له تاريخ انتهاء
-# ويمكن ربطه بسيرفرات محددة. المستخدم يستلم رابطًا واحدًا (/sub/<token>)
-# يستعمله في أي تطبيق v2ray و يتحدّث تلقائيًا عند إضافة/حذف السيرفرات.
+# روابط الاشتراك المدفوعة: كل توكن يمثّل مستخدمًا واحدًا، له تاريخ انتهاء.
+# تُبنى من سيرفرات الاشتراك (category='sub') فقط — معزولة عن سيرفرات التطبيق.
 
 def create_subscription(label: str, days: int = 0,
                         server_ids: str = "", note: str = "") -> Dict[str, Any]:
-    """ينشئ توكن اشتراك جديد. days=0 يعني بلا انتهاء. server_ids نص مفصول
-    بفواصل (فارغ = كل السيرفرات)."""
     token = secrets.token_urlsafe(24)
     expires = None
     if days and int(days) > 0:
         expires = (datetime.now() + timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """INSERT INTO subscriptions (token, label, expires_at, server_ids, note, active)
-               VALUES (?, ?, ?, ?, ?, 1)""",
-            (token, (label or "").strip(), expires,
-             (server_ids or "").strip(), (note or "").strip()),
-        )
+        cur = _cur(conn)
+        cur.execute(_s("""
+        INSERT INTO subscriptions (token, label, expires_at, server_ids, note, active)
+        VALUES (?, ?, ?, ?, ?, 1)
+        """), (token, (label or "").strip(), expires,
+               (server_ids or "").strip(), (note or "").strip()))
         conn.commit()
     finally:
         conn.close()
@@ -355,9 +398,9 @@ def create_subscription(label: str, days: int = 0,
 def get_subscription(token: str) -> Optional[Dict[str, Any]]:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM subscriptions WHERE token = ?", (token,))
-        row = cursor.fetchone()
+        cur = _cur(conn)
+        cur.execute(_s("SELECT * FROM subscriptions WHERE token = ?"), (token,))
+        row = cur.fetchone()
         return dict(row) if row else None
     finally:
         conn.close()
@@ -366,9 +409,9 @@ def get_subscription(token: str) -> Optional[Dict[str, Any]]:
 def list_subscriptions() -> List[Dict[str, Any]]:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM subscriptions ORDER BY id DESC")
-        return [dict(r) for r in cursor.fetchall()]
+        cur = _cur(conn)
+        cur.execute("SELECT * FROM subscriptions ORDER BY id DESC")
+        return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -376,11 +419,11 @@ def list_subscriptions() -> List[Dict[str, Any]]:
 def set_subscription_active(token: str, active: bool) -> bool:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE subscriptions SET active = ? WHERE token = ?",
-                       (1 if active else 0, token))
+        cur = _cur(conn)
+        cur.execute(_s("UPDATE subscriptions SET active = ? WHERE token = ?"),
+                    (1 if active else 0, token))
         conn.commit()
-        return cursor.rowcount > 0
+        return cur.rowcount > 0
     finally:
         conn.close()
 
@@ -388,10 +431,10 @@ def set_subscription_active(token: str, active: bool) -> bool:
 def delete_subscription(token: str) -> bool:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM subscriptions WHERE token = ?", (token,))
+        cur = _cur(conn)
+        cur.execute(_s("DELETE FROM subscriptions WHERE token = ?"), (token,))
         conn.commit()
-        return cursor.rowcount > 0
+        return cur.rowcount > 0
     finally:
         conn.close()
 
@@ -399,8 +442,8 @@ def delete_subscription(token: str) -> bool:
 def touch_subscription(token: str) -> None:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE subscriptions SET last_used = CURRENT_TIMESTAMP WHERE token = ?", (token,))
+        cur = _cur(conn)
+        cur.execute(_s("UPDATE subscriptions SET last_used = CURRENT_TIMESTAMP WHERE token = ?"), (token,))
         conn.commit()
     finally:
         conn.close()
@@ -412,12 +455,11 @@ def touch_subscription(token: str) -> None:
 def add_admin(user_id, name: str = "") -> None:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """INSERT INTO admins (user_id, name) VALUES (?, ?)
-               ON CONFLICT(user_id) DO UPDATE SET name = excluded.name""",
-            (str(user_id), (name or "").strip()),
-        )
+        cur = _cur(conn)
+        cur.execute(_s("""
+        INSERT INTO admins (user_id, name) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET name = excluded.name
+        """), (str(user_id), (name or "").strip()))
         conn.commit()
     finally:
         conn.close()
@@ -426,10 +468,10 @@ def add_admin(user_id, name: str = "") -> None:
 def remove_admin(user_id) -> bool:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM admins WHERE user_id = ?", (str(user_id),))
+        cur = _cur(conn)
+        cur.execute(_s("DELETE FROM admins WHERE user_id = ?"), (str(user_id),))
         conn.commit()
-        return cursor.rowcount > 0
+        return cur.rowcount > 0
     finally:
         conn.close()
 
@@ -437,9 +479,9 @@ def remove_admin(user_id) -> bool:
 def list_admins() -> List[Dict[str, Any]]:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id, name, added_at FROM admins ORDER BY added_at ASC")
-        return [dict(r) for r in cursor.fetchall()]
+        cur = _cur(conn)
+        cur.execute("SELECT user_id, name, added_at FROM admins ORDER BY added_at ASC")
+        return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -447,12 +489,15 @@ def list_admins() -> List[Dict[str, Any]]:
 def is_admin(user_id) -> bool:
     conn = get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM admins WHERE user_id = ?", (str(user_id),))
-        return cursor.fetchone() is not None
+        cur = _cur(conn)
+        cur.execute(_s("SELECT 1 FROM admins WHERE user_id = ?"), (str(user_id),))
+        return cur.fetchone() is not None
     finally:
         conn.close()
 
 
-# Initialize immediately on import
-init_db()
+# Initialize immediately on import (لا يوقف التشغيل إذا فشل الاتصال مؤقتًا).
+try:
+    init_db()
+except Exception as _e:
+    print(f"[database] WARNING: init_db failed: {_e}")
