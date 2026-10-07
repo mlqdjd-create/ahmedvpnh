@@ -346,6 +346,16 @@ def get_servers():
         if s.get("payload"):
             item["payload"] = s["payload"]
         result.append(item)
+    # ⚖️ موازنة الحمل: الأقل ازدحامًا أولاً (حسب المستخدمين المتصلين الآن)
+    try:
+        counts = {c["server"]: c["users"] for c in database.get_per_server_counts()}
+        for it in result:
+            it["_load"] = counts.get(it.get("name", ""), 0)
+        result.sort(key=lambda x: x.get("_load", 0))
+        for it in result:
+            it.pop("_load", None)
+    except Exception:
+        pass
     return {"servers": result}
 
 
@@ -449,10 +459,16 @@ def stats():
 @app.get("/api/notifications", dependencies=[Depends(verify_app_signature)])
 def get_notification():
     """Latest announcement — the app polls this and shows a notification."""
-    ann = database.get_latest_announcement()
+    try:
+        ann = database.get_latest_announcement()
+    except Exception:
+        return {"id": 0, "message": ""}   # ✅ لا نرجع 500 أبدًا — الإعلان اختياري
     if not ann:
         return {"id": 0, "message": ""}
-    return {"id": ann["id"], "message": ann["message"]}
+    try:
+        return {"id": ann["id"], "message": ann["message"]}
+    except Exception:
+        return {"id": 0, "message": ""}
 
 
 @app.post("/api/notifications", dependencies=[Depends(verify_admin_key)])

@@ -36,6 +36,11 @@ def get_connection():
 def _cur(conn):
     if IS_POSTGRES:
         return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    # ✅ نجعل صفوف SQLite تدعم الوصول بالمفتاح والفهرس معًا (dict(row) و row[0])
+    try:
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        pass
     return conn.cursor()
 
 
